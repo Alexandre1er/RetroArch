@@ -3372,6 +3372,10 @@ MSG_HASH(
    "Laitteen indeksi"
    )
 MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_INPUT_DEVICE_RESERVED_DEVICE_NAME,
+   "Laite varattu tälle pelaajalle"
+   )
+MSG_HASH(
    MENU_ENUM_LABEL_VALUE_INPUT_REMAP_PORT,
    "Määritetty portti"
    )

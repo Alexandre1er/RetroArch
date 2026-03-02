@@ -2435,6 +2435,10 @@ MSG_HASH(
 /* Settings > Video > HDR */
 
 MSG_HASH(
+   MENU_ENUM_SUBLABEL_VIDEO_HDR_ENABLE,
+   "지원되는 디스플레이에서의 HDR 출력 모드를 설정합니다. 참고: scRGB로 설정할 경우 OS 컴포지터에 의한 HDR10 변환이 셰이더 마스크 적용 후에 수행되므로, 일부 엄격 CRT 셰이더 마스크가 뭉개질 수 있습니다."
+   )
+MSG_HASH(
    MENU_ENUM_LABEL_VALUE_VIDEO_HDR_MODE_OFF,
    "끔"
    )
@@ -4102,6 +4106,10 @@ MSG_HASH(
 MSG_HASH(
    MENU_ENUM_SUBLABEL_INPUT_DEVICE_INDEX,
    "RetroArch가 인식하는 물리적 컨트롤러입니다."
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_INPUT_DEVICE_RESERVED_DEVICE_NAME,
+   "이 플레이어에게 예약된 장치"
    )
 MSG_HASH(
    MENU_ENUM_SUBLABEL_INPUT_DEVICE_RESERVED_DEVICE_NAME,

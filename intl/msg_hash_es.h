@@ -4072,6 +4072,10 @@ MSG_HASH(
    "El mando físico tal y como lo reconoce RetroArch."
    )
 MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_INPUT_DEVICE_RESERVED_DEVICE_NAME,
+   "Dispositivo reservado para este jugador"
+   )
+MSG_HASH(
    MENU_ENUM_SUBLABEL_INPUT_DEVICE_RESERVED_DEVICE_NAME,
    "Este mando será asignado a este jugador siguiendo el tipo de reserva."
    )

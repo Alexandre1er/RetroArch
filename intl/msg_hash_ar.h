@@ -860,35 +860,51 @@ MSG_HASH(
 
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_CONFIGURATIONS,
-   "تحميل ملف التكوين"
+   "تحميل الإعدادات"
    )
 MSG_HASH(
    MENU_ENUM_SUBLABEL_CONFIGURATIONS,
-   "تحميل الإعدادات الحالية واستبدال القيم الموجودة"
+   "تحميل الإعدادات الموجودة واستبدل القيم الحالية."
    )
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_SAVE_CURRENT_CONFIG,
-   "قراءة إعدادات التكوين الحالية"
+   "حفظ الإعدادات الحالية"
    )
 MSG_HASH(
    MENU_ENUM_SUBLABEL_SAVE_CURRENT_CONFIG,
-   "استبدال ملف الإعدادات الحالي"
+   "استبدال ملف الإعدادات الحالي."
    )
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_SAVE_NEW_CONFIG,
-   "حفظ الإعدادات"
+   "حفظ إعدادات جديدة"
    )
 MSG_HASH(
    MENU_ENUM_SUBLABEL_SAVE_NEW_CONFIG,
-   "حفظ الإعدادات الحالية في ملف منفصل"
+   "حفظ الإعدادات الحالية في ملف منفصل."
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_SAVE_AS_CONFIG,
+   "حفظ الإعدادات كـ"
+   )
+MSG_HASH(
+   MENU_ENUM_SUBLABEL_SAVE_AS_CONFIG,
+   "احفظ الإعدادات الحالية كملف إعدادات مخصص."
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_SAVE_MAIN_CONFIG,
+   "حفظ الإعدادات الرئيسية"
+   )
+MSG_HASH(
+   MENU_ENUM_SUBLABEL_SAVE_MAIN_CONFIG,
+   "احفظ الإعدادات الحالية كإعدادات رئيسية."
    )
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_RESET_TO_DEFAULT_CONFIG,
-   "إعادة التعيين إلى الافتراضي"
+   "إعادة التعيين إلى الوضع الإفتراضي"
    )
 MSG_HASH(
    MENU_ENUM_SUBLABEL_RESET_TO_DEFAULT_CONFIG,
-   "إعادة الإعدادات للوضع الافتراضي."
+   "إعادة ضبط الإعدادات الحالية إلى القيم الافتراضية."
    )
 
 /* Main Menu > Help */
