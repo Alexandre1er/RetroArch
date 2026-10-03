@@ -175,6 +175,11 @@ typedef ID3D12DeviceRemovedExtendedDataSettings*  D3D12DeviceRemovedExtendedData
 #endif
 typedef ID3D12InfoQueue*                          D3D12InfoQueue;
 
+/* Constant slots for plain mesh draws: 256 bytes each, the alignment a
+ * constant buffer view needs */
+#define D3D12_MESH_CB_SIZE  256
+#define D3D12_MESH_CB_SLOTS 256
+
 typedef struct
 {
    D3D12DescriptorHeap         handle; /* descriptor pool */
@@ -560,8 +565,38 @@ typedef struct
    D3D12_GPU_DESCRIPTOR_HANDLE     samplers[RARCH_FILTER_MAX][RARCH_WRAP_MAX];
    math_matrix_4x4                 mvp, mvp_no_rot, identity;
    struct video_viewport           vp;
-   D3D12Resource                   menu_pipeline_vbo;
-   D3D12_VERTEX_BUFFER_VIEW        menu_pipeline_vbo_view;
+   /* gfx_display meshes the effects draw from, by mesh id, in upload
+    * buffers of their own. One that gives way is retired until the
+    * frame that last drew it has, as the font atlas's are. */
+   struct
+   {
+      D3D12Resource            vbo;
+      D3D12_VERTEX_BUFFER_VIEW view;
+      D3D12_INDEX_BUFFER_VIEW  ibo_view;
+      uint64_t                 last_draw;
+      uint32_t                 id;
+   } meshes[4];
+   /* Plain meshes: their pipeline, and a ring of constant slots in an
+    * upload buffer kept mapped, each tagged with the fence value of the
+    * frame that last used it */
+   D3D12PipelineState              mesh_pipe;
+   /* The pipeline state the menu effects are made from when first
+    * drawn, and which of them have been tried, one bit each */
+   D3D12_GRAPHICS_PIPELINE_STATE_DESC effect_desc;
+   bool                            effect_desc_valid;
+   unsigned                        effects_tried;
+   D3D12Resource                   mesh_cb;
+   uint8_t                        *mesh_cb_mapped;
+   D3D12_GPU_VIRTUAL_ADDRESS       mesh_cb_va;
+   UINT64                          mesh_cb_fence[D3D12_MESH_CB_SLOTS];
+   unsigned                        mesh_cb_next;
+   struct
+   {
+      D3D12Resource vbo;
+      UINT64        fence;
+   } meshes_retired[4];
+   unsigned                        meshes_retired_count;
+   uint64_t                        mesh_draws;
 
 #if defined(DEBUG) && !defined(__MINGW32__) && !defined(__MINGW64__)
    D3D12Debug debugController;
@@ -638,6 +673,14 @@ typedef struct
    unsigned                      region_x1;
    unsigned                      region_y1;
    bool                          region_pending;
+   /* Textures the atlas outgrew, and the queue fence value past which
+    * no command list still names them; released then, not waited for */
+   struct
+   {
+      d3d12_texture_t            texture;
+      UINT64                     fence;
+   }                             retired[2];
+   unsigned                      retired_count;
 } d3d12_font_t;
 
 static D3D12_RENDER_TARGET_BLEND_DESC d3d12_blend_enable_desc = {
@@ -842,6 +885,14 @@ static D3D12_CPU_DESCRIPTOR_HANDLE d3d12_descriptor_heap_slot_alloc(d3d12_descri
 static void d3d12_queue_drain(d3d12_video_t *d3d12)
 {
    D3D12Fence fence = d3d12->queue.fence;
+
+   /* A driver whose start-up failed before it had a queue is freed
+    * through d3d12_gfx_free() like any other, which begins by
+    * draining: with no device there is no queue and no fence, and
+    * this used to call through both. Nothing was queued; nothing to
+    * wait for. */
+   if (!d3d12->queue.handle || !fence)
+      return;
 
    d3d12->queue.handle->lpVtbl->Signal(d3d12->queue.handle, fence,
          ++d3d12->queue.fenceValue);
@@ -1250,6 +1301,119 @@ static void gfx_display_d3d12_blend_end(void *data)
    cmd->lpVtbl->SetPipelineState(cmd, (D3D12PipelineState)d3d12->sprites.pipe);
 }
 
+static void d3d12_init_pipeline(
+      D3D12Device                         device,
+      D3DBlob                             vs_code,
+      D3DBlob                             ps_code,
+      D3DBlob                             gs_code,
+      D3D12_GRAPHICS_PIPELINE_STATE_DESC* desc,
+      D3D12PipelineState*                 out);
+
+/* A menu effect's pipeline, made the first time the effect is drawn
+ * rather than all six at start: at most one is ever on screen, and the
+ * effects are no longer XMB's alone. False when it cannot be had, and
+ * the effect is not drawn; one that will not compile is not tried again
+ * until the driver is. */
+static bool d3d12_effect_pipe(d3d12_video_t *d3d12, unsigned pipeline_id)
+{
+   static const D3D12_INPUT_ELEMENT_DESC ribbon_desc[] = {
+      { "POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0,
+         D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+   };
+   static const D3D12_INPUT_ELEMENT_DESC quad_desc[] = {
+      { "POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, offsetof(d3d12_vertex_t, position),
+         D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+      { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, offsetof(d3d12_vertex_t, texcoord),
+         D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+   };
+   static const char ribbon[] =
+#include "d3d_shaders/ribbon_sm4.hlsl.h"
+      ;
+   static const char ribbon_simple[] =
+#include "d3d_shaders/ribbon_simple_sm4.hlsl.h"
+      ;
+   static const char simple_snow[] =
+#include "d3d_shaders/simple_snow_sm4.hlsl.h"
+      ;
+   static const char snow[] =
+#include "d3d_shaders/snow_sm4.hlsl.h"
+      ;
+   static const char bokeh[] =
+#include "d3d_shaders/bokeh_sm4.hlsl.h"
+      ;
+   static const char snowflake[] =
+#include "d3d_shaders/snowflake_sm4.hlsl.h"
+      ;
+   D3D12_GRAPHICS_PIPELINE_STATE_DESC desc;
+   D3DBlob vs_code  = NULL;
+   D3DBlob ps_code  = NULL;
+   const char *src  = NULL;
+   size_t size      = 0;
+   bool ribbons     = false;
+   unsigned bit;
+
+   switch (pipeline_id)
+   {
+      case VIDEO_SHADER_MENU:
+         src = ribbon;        size = sizeof(ribbon);        bit = 1 << 0; ribbons = true;
+         break;
+      case VIDEO_SHADER_MENU_2:
+         src = ribbon_simple; size = sizeof(ribbon_simple); bit = 1 << 1; ribbons = true;
+         break;
+      case VIDEO_SHADER_MENU_3:
+         src = simple_snow;   size = sizeof(simple_snow);   bit = 1 << 2;
+         break;
+      case VIDEO_SHADER_MENU_4:
+         src = snow;          size = sizeof(snow);          bit = 1 << 3;
+         break;
+      case VIDEO_SHADER_MENU_5:
+         src = bokeh;         size = sizeof(bokeh);         bit = 1 << 4;
+         break;
+      case VIDEO_SHADER_MENU_6:
+         src = snowflake;     size = sizeof(snowflake);     bit = 1 << 5;
+         break;
+      default:
+         return false;
+   }
+   if (d3d12->pipes[pipeline_id])
+      return true;
+   if ((d3d12->effects_tried & bit) || !d3d12->effect_desc_valid)
+      return false;
+   d3d12->effects_tried |= bit;
+
+   desc                       = d3d12->effect_desc;
+   desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+   if (ribbons)
+   {
+      /* The ribbons multiply what is under them */
+      desc.BlendState.RenderTarget[0].SrcBlend  = D3D12_BLEND_DEST_COLOR;
+      desc.BlendState.RenderTarget[0].DestBlend = D3D12_BLEND_ONE;
+      desc.InputLayout.pInputElementDescs       = ribbon_desc;
+      desc.InputLayout.NumElements              = countof(ribbon_desc);
+   }
+   else
+   {
+      /* Standard alpha blending for snow, bokeh and snowflake: the
+       * ribbons' multiplicative blend would make white snowflakes
+       * vanish against coloured backgrounds */
+      desc.BlendState.RenderTarget[0].SrcBlend       = D3D12_BLEND_SRC_ALPHA;
+      desc.BlendState.RenderTarget[0].DestBlend      = D3D12_BLEND_INV_SRC_ALPHA;
+      desc.BlendState.RenderTarget[0].BlendOp        = D3D12_BLEND_OP_ADD;
+      desc.BlendState.RenderTarget[0].SrcBlendAlpha  = D3D12_BLEND_SRC_ALPHA;
+      desc.BlendState.RenderTarget[0].DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
+      desc.BlendState.RenderTarget[0].BlendOpAlpha   = D3D12_BLEND_OP_ADD;
+      desc.InputLayout.pInputElementDescs            = quad_desc;
+      desc.InputLayout.NumElements                   = countof(quad_desc);
+   }
+   if (     d3d_compile(src, size, NULL, "VSMain", "vs_5_0", &vs_code)
+         && d3d_compile(src, size, NULL, "PSMain", "ps_5_0", &ps_code))
+      d3d12_init_pipeline(d3d12->device, vs_code, ps_code, NULL, &desc,
+            &d3d12->pipes[pipeline_id]);
+   Release(vs_code);
+   Release(ps_code);
+   return d3d12->pipes[pipeline_id] != NULL;
+}
+
 static void gfx_display_d3d12_draw(gfx_display_ctx_draw_t *draw,
       void *data, unsigned video_dims)
 {
@@ -1270,6 +1434,9 @@ static void gfx_display_d3d12_draw(gfx_display_ctx_draw_t *draw,
       case VIDEO_SHADER_MENU_4:
       case VIDEO_SHADER_MENU_5:
       case VIDEO_SHADER_MENU_6:
+         /* Made by the pipeline call before this, or not at all */
+         if (!d3d12->pipes[draw->pipeline_id])
+            return;
          cmd->lpVtbl->SetPipelineState(cmd, (D3D12PipelineState)d3d12->pipes[draw->pipeline_id]);
          cmd->lpVtbl->DrawInstanced(cmd, draw->coords->vertices, 1, 0, 0);
          cmd->lpVtbl->SetPipelineState(cmd, (D3D12PipelineState)d3d12->sprites.pipe);
@@ -1408,6 +1575,186 @@ static void gfx_display_d3d12_draw(gfx_display_ctx_draw_t *draw,
    }
 }
 
+/* The slot whose buffer holds @mesh's vertices, made the first time it
+ * is drawn. A slot that gives way to it is retired until the GPU has
+ * finished the frame being recorded; -1 when there is no slot to be had
+ * this frame, and the effect is not drawn. */
+static int d3d12_mesh_slot(d3d12_video_t *d3d12,
+      const gfx_display_mesh_t *mesh)
+{
+   D3D12_RANGE read_range;
+   void *mapped    = NULL;
+   uint64_t oldest = (uint64_t)-1;
+   UINT64 done     = d3d12->queue.fence->lpVtbl->GetCompletedValue(
+         d3d12->queue.fence);
+   int slot        = -1;
+   unsigned i, kept;
+
+   for (i = 0, kept = 0; i < d3d12->meshes_retired_count; i++)
+   {
+      if (done >= d3d12->meshes_retired[i].fence)
+         Release(d3d12->meshes_retired[i].vbo);
+      else
+         d3d12->meshes_retired[kept++] = d3d12->meshes_retired[i];
+   }
+   d3d12->meshes_retired_count = kept;
+
+   for (i = 0; i < ARRAY_SIZE(d3d12->meshes); i++)
+   {
+      if (d3d12->meshes[i].vbo && d3d12->meshes[i].id == mesh->id)
+         return (int)i;
+      if (!d3d12->meshes[i].vbo)
+      {
+         if (slot < 0 || d3d12->meshes[slot].vbo)
+            slot = (int)i;
+      }
+      else if ((slot < 0 || d3d12->meshes[slot].vbo)
+            && d3d12->meshes[i].last_draw < oldest)
+      {
+         oldest = d3d12->meshes[i].last_draw;
+         slot   = (int)i;
+      }
+   }
+   if (slot < 0)
+      return -1;
+   if (d3d12->meshes[slot].vbo)
+   {
+      if (d3d12->meshes_retired_count >= ARRAY_SIZE(d3d12->meshes_retired))
+         return -1;
+      /* This frame's command list may already name it; it signals the
+       * next fence value when it is done */
+      d3d12->meshes_retired[d3d12->meshes_retired_count].vbo   =
+         d3d12->meshes[slot].vbo;
+      d3d12->meshes_retired[d3d12->meshes_retired_count].fence =
+         d3d12->queue.fenceValue + 1;
+      d3d12->meshes_retired_count++;
+      d3d12->meshes[slot].vbo = NULL;
+      d3d12->meshes[slot].id  = 0;
+   }
+
+   /* Vertices, then any indices, in the one upload buffer */
+   d3d12->meshes[slot].view.StrideInBytes  = sizeof(gfx_display_mesh_vertex_t);
+   d3d12->meshes[slot].view.SizeInBytes    = mesh->vertex_count
+      * sizeof(gfx_display_mesh_vertex_t);
+   d3d12->meshes[slot].ibo_view.SizeInBytes = mesh->index_count
+      * sizeof(uint16_t);
+   d3d12->meshes[slot].ibo_view.Format      = DXGI_FORMAT_R16_UINT;
+   d3d12->meshes[slot].view.BufferLocation = d3d12_create_buffer(
+         d3d12->device, d3d12->meshes[slot].view.SizeInBytes
+         + d3d12->meshes[slot].ibo_view.SizeInBytes,
+         &d3d12->meshes[slot].vbo);
+   d3d12->meshes[slot].ibo_view.BufferLocation =
+      d3d12->meshes[slot].view.BufferLocation
+      + d3d12->meshes[slot].view.SizeInBytes;
+   if (!d3d12->meshes[slot].vbo)
+      return -1;
+   read_range.Begin = 0;
+   read_range.End   = 0;
+   if (FAILED(D3D12Map(d3d12->meshes[slot].vbo, 0, &read_range, &mapped))
+         || !mapped)
+   {
+      Release(d3d12->meshes[slot].vbo);
+      return -1;
+   }
+   memcpy(mapped, mesh->vertices, d3d12->meshes[slot].view.SizeInBytes);
+   if (mesh->indices)
+      memcpy((uint8_t*)mapped + d3d12->meshes[slot].view.SizeInBytes,
+            mesh->indices, d3d12->meshes[slot].ibo_view.SizeInBytes);
+   D3D12Unmap(d3d12->meshes[slot].vbo, 0, NULL);
+   d3d12->meshes[slot].id = mesh->id;
+   return slot;
+}
+
+/* The next of the mesh constant slots, unless the GPU may still read it:
+ * each is tagged with the fence value of the frame that used it, and
+ * the ring is not waited on - a draw that finds the next slot busy is
+ * streamed instead */
+static bool d3d12_mesh_cb_slot(d3d12_video_t *d3d12, unsigned *slot)
+{
+   UINT64 done = d3d12->queue.fence->lpVtbl->GetCompletedValue(
+         d3d12->queue.fence);
+   unsigned s  = d3d12->mesh_cb_next;
+   if (d3d12->mesh_cb_fence[s] > done)
+      return false;
+   d3d12->mesh_cb_fence[s] = d3d12->queue.fenceValue + 1;
+   d3d12->mesh_cb_next     = (s + 1) % D3D12_MESH_CB_SLOTS;
+   *slot                   = s;
+   return true;
+}
+
+static bool gfx_display_d3d12_mesh_draw(void *data, unsigned video_dims,
+      const gfx_display_mesh_t *mesh, const float *mvp,
+      uintptr_t texture, const float *tint)
+{
+   /* The vertex stage's constant buffer: a float4x4, then a float4 */
+   struct
+   {
+      math_matrix_4x4 mvp;
+      float tint[4];
+   } ubo;
+   math_matrix_4x4 user;
+   D3D12GraphicsCommandList cmd;
+   d3d12_video_t *d3d12  = (d3d12_video_t*)data;
+   d3d12_texture_t *tex  = (d3d12_texture_t*)texture;
+   unsigned cb;
+   int slot;
+
+   (void)video_dims;
+   if (     !d3d12 || !mesh || !tex || !d3d12->mesh_pipe
+         || !d3d12->mesh_cb_mapped)
+      return false;
+#ifdef HAVE_DXGI_HDR
+   /* Built for the swapchain's own format: an HDR target streams */
+   if (     (d3d12->chain.current_rt_format == DXGI_FORMAT_R10G10B10A2_UNORM)
+         || (d3d12->chain.current_rt_format == DXGI_FORMAT_R16G16B16A16_FLOAT))
+      return false;
+#endif
+   if ((slot = d3d12_mesh_slot(d3d12, mesh)) < 0)
+      return false;
+   if (!d3d12_mesh_cb_slot(d3d12, &cb))
+      return false;
+   d3d12->meshes[slot].last_draw = ++d3d12->mesh_draws;
+   cmd = d3d12->queue.cmd;
+
+   /* Through the same MVP the quads go through, so the display's 0..1
+    * space lands where theirs does */
+   memcpy(user.data, mvp, sizeof(user.data));
+   matrix_4x4_multiply(ubo.mvp, d3d12->ubo_values.mvp, user);
+   memcpy(ubo.tint, tint, sizeof(ubo.tint));
+   memcpy(d3d12->mesh_cb_mapped + (size_t)cb * D3D12_MESH_CB_SIZE,
+         &ubo, sizeof(ubo));
+
+   if (tex->dirty)
+      d3d12_upload_texture(cmd, tex, d3d12);
+   cmd->lpVtbl->SetPipelineState(cmd, (D3D12PipelineState)d3d12->mesh_pipe);
+   cmd->lpVtbl->SetGraphicsRootConstantBufferView(cmd, ROOT_ID_UBO,
+         d3d12->mesh_cb_va + (D3D12_GPU_VIRTUAL_ADDRESS)cb * D3D12_MESH_CB_SIZE);
+   cmd->lpVtbl->SetGraphicsRootDescriptorTable(cmd, ROOT_ID_TEXTURE_T,
+         tex->gpu_descriptor[0]);
+   cmd->lpVtbl->SetGraphicsRootDescriptorTable(cmd, ROOT_ID_SAMPLER_T,
+         tex->sampler);
+   cmd->lpVtbl->IASetPrimitiveTopology(cmd,
+         mesh->topology == GFX_MESH_TRIANGLE_STRIP
+         ? D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP
+         : D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+   cmd->lpVtbl->IASetVertexBuffers(cmd, 0, 1, &d3d12->meshes[slot].view);
+   if (mesh->indices)
+   {
+      cmd->lpVtbl->IASetIndexBuffer(cmd, &d3d12->meshes[slot].ibo_view);
+      cmd->lpVtbl->DrawIndexedInstanced(cmd, mesh->index_count, 1, 0, 0, 0);
+   }
+   else
+      cmd->lpVtbl->DrawInstanced(cmd, mesh->vertex_count, 1, 0, 0);
+
+   /* Back to what the quads after this one draw with */
+   cmd->lpVtbl->SetGraphicsRootConstantBufferView(cmd, ROOT_ID_UBO,
+         d3d12->ubo_view.BufferLocation);
+   cmd->lpVtbl->SetPipelineState(cmd, (D3D12PipelineState)d3d12->sprites.pipe);
+   cmd->lpVtbl->IASetPrimitiveTopology(cmd, D3D_PRIMITIVE_TOPOLOGY_POINTLIST);
+   cmd->lpVtbl->IASetVertexBuffers(cmd, 0, 1, &d3d12->sprites.vbo_view);
+   return true;
+}
+
 static void gfx_display_d3d12_draw_pipeline(gfx_display_ctx_draw_t *draw,
       gfx_display_t *p_disp,
       void *data, unsigned video_dims)
@@ -1418,40 +1765,30 @@ static void gfx_display_d3d12_draw_pipeline(gfx_display_ctx_draw_t *draw,
    if (!d3d12 || !draw)
       return;
 
+   /* Before anything is bound for it */
+   if (!d3d12_effect_pipe(d3d12, draw->pipeline_id))
+      return;
    cmd                  = d3d12->queue.cmd;
 
    switch (draw->pipeline_id)
    {
       case VIDEO_SHADER_MENU:
       case VIDEO_SHADER_MENU_2:
+         if (p_disp->effect_mesh)
          {
-            video_coord_array_t* ca   = &p_disp->dispca;
-
-            if (!d3d12->menu_pipeline_vbo)
-            {
-               D3D12_RANGE read_range;
-               void*       vertex_data_begin;
-
-               d3d12->menu_pipeline_vbo_view.StrideInBytes  = 2 * sizeof(float);
-               d3d12->menu_pipeline_vbo_view.SizeInBytes    =
-                  ca->coords.vertices * d3d12->menu_pipeline_vbo_view.StrideInBytes;
-               d3d12->menu_pipeline_vbo_view.BufferLocation = d3d12_create_buffer(
-                     d3d12->device, d3d12->menu_pipeline_vbo_view.SizeInBytes,
-                     &d3d12->menu_pipeline_vbo);
-
-               read_range.Begin           = 0;
-               read_range.End             = 0;
-               D3D12Map(d3d12->menu_pipeline_vbo, 0,
-                     &read_range, &vertex_data_begin);
-               memcpy(vertex_data_begin, ca->coords.vertex,
-                     d3d12->menu_pipeline_vbo_view.SizeInBytes);
-               D3D12Unmap(d3d12->menu_pipeline_vbo, 0, NULL);
-            }
+            /* From the ribbon mesh's own buffer, its position only */
+            const gfx_display_mesh_t *mesh = p_disp->effect_mesh;
+            int slot = d3d12_mesh_slot(d3d12, mesh);
+            if (slot < 0)
+               return;
+            d3d12->meshes[slot].last_draw = ++d3d12->mesh_draws;
             cmd->lpVtbl->IASetVertexBuffers(cmd, 0, 1,
-                  &d3d12->menu_pipeline_vbo_view);
-            draw->coords->vertices = ca->coords.vertices;
+                  &d3d12->meshes[slot].view);
+            draw->coords->vertices = mesh->vertex_count;
             break;
          }
+         /* Nothing to draw it from */
+         return;
 
       case VIDEO_SHADER_MENU_3:
       case VIDEO_SHADER_MENU_4:
@@ -1466,12 +1803,9 @@ static void gfx_display_d3d12_draw_pipeline(gfx_display_ctx_draw_t *draw,
    cmd->lpVtbl->IASetPrimitiveTopology(cmd,
          D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
 
-   d3d12->ubo_values.time  += 0.01f;
-   /* Wrap at 65536 to keep fp32 increments precise. 0.01 stays
-    * exactly representable up to t ~ 167772 (where 0.5*ulp first
-    * exceeds 0.01), so 65536 has wide margin and wraps roughly
-    * every 30 h of cumulative menu time, making the discontinuity
-    * effectively unobservable. */
+   /* The effects' clock, one step ahead, as this driver has always
+    * drawn them */
+   d3d12->ubo_values.time   = p_disp->effect_time + 0.01f;
    if (d3d12->ubo_values.time > 65536.0f)
       d3d12->ubo_values.time -= 65536.0f;
    d3d12->ubo_values.alpha  = draw->color ? draw->color[3] : 1.0f;
@@ -1593,6 +1927,86 @@ static void d3d12_font_update_atlas_region(d3d12_font_t *font,
 }
 
 
+/* Makes the font texture at the atlas's size and stages all of it for
+ * the copy at first draw: at init, and when the atlas has grown. */
+static void d3d12_font_make_texture(d3d12_video_t *d3d12,
+      d3d12_font_t *font)
+{
+   font->texture.sampler     = d3d12->samplers[RARCH_FILTER_LINEAR][RARCH_WRAP_BORDER];
+   font->texture.desc.Width  = font->atlas->width;
+   font->texture.desc.Height = font->atlas->height;
+   if (font->atlas->format == FONT_ATLAS_FORMAT_A16)
+   {
+      /* 16-bit coverage: sample alpha from the R16 channel so the
+       * A8 pixel shader entry keeps working unchanged */
+      font->texture.desc.Format = DXGI_FORMAT_R16_UNORM;
+      font->texture.srv_mapping = D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(
+            D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_0,
+            D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_0,
+            D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_0,
+            D3D12_SHADER_COMPONENT_MAPPING_FROM_MEMORY_COMPONENT_0);
+   }
+   else
+      font->texture.desc.Format = DXGI_FORMAT_A8_UNORM;
+   font->texture.srv_heap    = &d3d12->desc.srv_heap;
+   d3d12_init_texture(d3d12->device, &font->texture);
+   if (font->texture.upload_buffer)
+   {
+      if (font->atlas->format == FONT_ATLAS_FORMAT_A16)
+         /* stage the whole atlas; the boxed copy at first draw
+          * transfers it (the generic path's conversion table does
+          * not cover R16) */
+         d3d12_font_update_atlas_region(font,
+               0, 0, font->atlas->width, font->atlas->height);
+      else
+         d3d12_update_texture(
+               font->atlas->width, font->atlas->height,
+               font->atlas->width, DXGI_FORMAT_A8_UNORM,
+               font->atlas->buffer, &font->texture);
+   }
+   font->atlas->dirty = false;
+}
+
+/* Releases the textures the fence has passed */
+static void d3d12_font_reap(d3d12_video_t *d3d12, d3d12_font_t *font)
+{
+   unsigned i, kept = 0;
+   UINT64 done = d3d12->queue.fence->lpVtbl->GetCompletedValue(
+         d3d12->queue.fence);
+   for (i = 0; i < font->retired_count; i++)
+   {
+      if (done >= font->retired[i].fence)
+         d3d12_release_texture(&font->retired[i].texture);
+      else
+         font->retired[kept++] = font->retired[i];
+   }
+   font->retired_count = kept;
+}
+
+/* The atlas grew: a texture at its new size, the old one retired until
+ * the frames still drawing from it are done - this frame's command
+ * list, which signals the next fence value at its end, names only the
+ * new one. With both retirement slots taken the old one stays, and
+ * the atlas's new cells wait for a later frame. */
+static void d3d12_font_follow_atlas(d3d12_video_t *d3d12,
+      d3d12_font_t *font)
+{
+   d3d12_font_reap(d3d12, font);
+   if (     font->texture.desc.Width  == font->atlas->width
+         && font->texture.desc.Height == font->atlas->height)
+      return;
+   if (font->retired_count >= sizeof(font->retired)
+         / sizeof(font->retired[0]))
+      return;
+   font->retired[font->retired_count].texture = font->texture;
+   font->retired[font->retired_count].fence   =
+      d3d12->queue.fenceValue + 1;
+   font->retired_count++;
+   memset(&font->texture, 0, sizeof(font->texture));
+   font->region_pending = false;
+   d3d12_font_make_texture(d3d12, font);
+}
+
 static void * d3d12_font_init(void* data, const char* font_path,
       float font_size, bool is_threaded)
 {
@@ -1622,40 +2036,11 @@ static void * d3d12_font_init(void* data, const char* font_path,
 
    font->d3d12               = d3d12;
    font->atlas               = font->font_driver->get_atlas(font->font_data);
-   font->texture.sampler     = d3d12->samplers[RARCH_FILTER_LINEAR][RARCH_WRAP_BORDER];
-   font->texture.desc.Width  = font->atlas->width;
-   font->texture.desc.Height = font->atlas->height;
-   if (font->atlas->format == FONT_ATLAS_FORMAT_A16)
-   {
-      /* 16-bit coverage: sample alpha from the R16 channel so the
-       * A8 pixel shader entry keeps working unchanged */
-      font->texture.desc.Format = DXGI_FORMAT_R16_UNORM;
-      font->texture.srv_mapping = D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(
-            D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_0,
-            D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_0,
-            D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_0,
-            D3D12_SHADER_COMPONENT_MAPPING_FROM_MEMORY_COMPONENT_0);
-   }
-   else
-      font->texture.desc.Format = DXGI_FORMAT_A8_UNORM;
-   font->texture.srv_heap    = &d3d12->desc.srv_heap;
+   /* The atlas may grow, up to the largest 2D texture D3D12 has */
+   font->atlas->max_width    = D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION;
+   font->atlas->max_height   = D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION;
    d3d12_release_texture(&font->texture);
-   d3d12_init_texture(d3d12->device, &font->texture);
-   if (font->texture.upload_buffer)
-   {
-      if (font->atlas->format == FONT_ATLAS_FORMAT_A16)
-         /* stage the whole atlas; the boxed copy at first draw
-          * transfers it (the generic path's conversion table does
-          * not cover R16) */
-         d3d12_font_update_atlas_region(font,
-               0, 0, font->atlas->width, font->atlas->height);
-      else
-         d3d12_update_texture(
-               font->atlas->width, font->atlas->height,
-               font->atlas->width, DXGI_FORMAT_A8_UNORM,
-               font->atlas->buffer, &font->texture);
-   }
-   font->atlas->dirty = false;
+   d3d12_font_make_texture(d3d12, font);
 
    return font;
 }
@@ -1681,47 +2066,24 @@ static void d3d12_font_free(void* data, bool is_threaded)
       font->font_driver->free(font->font_data);
 
    d3d12_release_texture(&font->texture);
+   {
+      unsigned i;
+      for (i = 0; i < font->retired_count; i++)
+         d3d12_release_texture(&font->retired[i].texture);
+   }
 
    free(font->acc);
    free(font);
 }
 
-static int d3d12_font_get_message_width(void* data,
-      const char* msg, size_t msg_len, float scale)
+static int d3d12_font_get_message_width(void *data, const char *msg,
+      size_t msg_len, float scale)
 {
-   size_t i;
-   int delta_x                      = 0;
-   const struct font_glyph* glyph_q = NULL;
-   d3d12_font_t* font               = (d3d12_font_t*)data;
-   const struct font_glyph* (*get_glyph)(void*, uint32_t);
-   void *font_data;
-
+   d3d12_font_t *font = (d3d12_font_t*)data;
    if (!font)
       return 0;
-
-   get_glyph = font->font_driver->get_glyph;
-   font_data = font->font_data;
-   glyph_q   = get_glyph(font_data, '?');
-
-   for (i = 0; i < msg_len; i++)
-   {
-      const struct font_glyph* glyph;
-      const char *msg_tmp = &msg[i];
-      unsigned    code    = utf8_walk(&msg_tmp);
-      unsigned    skip    = msg_tmp - &msg[i];
-
-      if (skip > 1)
-         i += skip - 1;
-
-      /* Do something smarter here ... */
-      if (!(glyph = get_glyph(font_data, code)))
-         if (!(glyph = glyph_q))
-            continue;
-
-      delta_x            += glyph->advance_x;
-   }
-
-   return delta_x * scale;
+   return font_renderer_get_message_width(font->font_driver,
+         font->font_data, msg, msg_len, scale);
 }
 
 /* Issue the boxed copy for the staged rectangle */
@@ -1773,6 +2135,7 @@ static void d3d12_font_render_msg(
       const char* msg, size_t msg_len,
       const struct font_params *params)
 {
+   font_params_resolved_t rp;
    float line_height;
    struct font_line_metrics *line_metrics = NULL;
    float                     x, y, scale, drop_mod, drop_alpha;
@@ -1803,50 +2166,32 @@ static void d3d12_font_render_msg(
    if (!d3d12 || (!(d3d12->flags & D3D12_ST_FLAG_SPRITES_ENABLE)))
       return;
 
+   /* Asked for before anything is laid out: it may have grown, and the
+    * texture coordinates are taken from the texture's size */
+   if (font->font_driver && font->font_data)
+   {
+      font->atlas = font->font_driver->get_atlas(font->font_data);
+      d3d12_font_follow_atlas(d3d12, font);
+   }
+
    width  = VIDEO_SCALE_W(d3d12->vp.full_dims);
    height = VIDEO_SCALE_H(d3d12->vp.full_dims);
 
-   if (params)
-   {
-      x          = params->x;
-      y          = params->y;
-      scale      = params->scale;
-      text_align = params->text_align;
-      drop_x     = params->drop_x;
-      drop_y     = params->drop_y;
-      drop_mod   = params->drop_mod;
-      drop_alpha = params->drop_alpha;
+   font_driver_resolve_params(params, &rp);
+   x          = rp.x;
+   y          = rp.y;
+   scale      = rp.scale;
+   text_align = rp.text_align;
+   drop_x     = rp.drop_x;
+   drop_y     = rp.drop_y;
+   drop_mod   = rp.drop_mod;
+   drop_alpha = rp.drop_alpha;
+   r          = rp.rgba[0];
+   g          = rp.rgba[1];
+   b          = rp.rgba[2];
+   alpha           = rp.rgba[3];
+   color      = DXGI_COLOR_RGBA(r, g, b, alpha);
 
-      r          = FONT_COLOR_GET_RED(params->color);
-      g          = FONT_COLOR_GET_GREEN(params->color);
-      b          = FONT_COLOR_GET_BLUE(params->color);
-      alpha      = FONT_COLOR_GET_ALPHA(params->color);
-      color      = DXGI_COLOR_RGBA(r, g, b, alpha);
-   }
-   else
-   {
-      settings_t *settings      = config_get_ptr();
-      float video_msg_pos_x     = settings->floats.video_msg_pos_x;
-      float video_msg_pos_y     = settings->floats.video_msg_pos_y;
-      float video_msg_color_r   = settings->floats.video_msg_color_r;
-      float video_msg_color_g   = settings->floats.video_msg_color_g;
-      float video_msg_color_b   = settings->floats.video_msg_color_b;
-      x                         = video_msg_pos_x;
-      y                         = video_msg_pos_y;
-      scale                     = 1.0f;
-      text_align                = TEXT_ALIGN_LEFT;
-
-      r                         = (video_msg_color_r * 255);
-      g                         = (video_msg_color_g * 255);
-      b                         = (video_msg_color_b * 255);
-      alpha                     = 255;
-      color                     = DXGI_COLOR_RGBA(r, g, b, alpha);
-
-      drop_x                    = -2;
-      drop_y                    = -2;
-      drop_mod                  = 0.3f;
-      drop_alpha                = 1.0f;
-   }
 
    glyph_q          = (font->font_driver)
       ? font->font_driver->get_glyph(font->font_data, '?') : NULL;
@@ -1928,145 +2273,105 @@ static void d3d12_font_render_msg(
    v_batch_start  = v;
    range.Begin    = (uintptr_t)v - (uintptr_t)vbo_start;
 
-   /* ---- Single fused pass: shadow + foreground per glyph ----
-    *
-    * Walk the message once. For each glyph, emit the foreground sprite
-    * and (if active) its shadow sprite immediately after.  This halves
-    * UTF-8 decode + glyph lookup cost compared to separate passes.
-    *
-    * For right/center alignment the retroactive shift must adjust both
-    * shadow and foreground sprites.  We track per-line start pointers
-    * for both sets.
-    *
-    * Shadow sprites are emitted *before* the foreground sprite so that
-    * the GPU draws them first (painter's order within the same draw
-    * call). */
+   /* One pass over the message: each glyph is looked up once and
+    * written as its shadow sprite (if any) and then its foreground
+    * sprite, so the shadow draws first. Right and centred lines are
+    * shifted, shadows and all, once their advance is known. */
    {
-      const char     *line_start = msg;
-      int             line_idx   = 0;
-      int             xi         = roundf(x * width);
+      d3d12_sprite_t *line_v_first = v;
+      bool line_ok                 = false;
+      int xi                       = roundf(x * width);
+      int lx                       = 0;
+      int ly                       = 0;
+      size_t line_cap              = font->block
+         ? (size_t)(font->acc_cap - font->acc_count)
+         : (size_t)d3d12->sprites.capacity;
 
-      while (*line_start)
-      {
-         const char        *p;
-         size_t             line_len;
-         size_t             i;
-         int                lx, ly;
-         d3d12_sprite_t    *line_v_first;
-
-         for (p = line_start; *p && *p != '\n'; p++)
-            ;
-         line_len = (size_t)(p - line_start);
-
-         if (line_len > (font->block
-                  ? (size_t)(font->acc_cap - font->acc_count)
-                  : (size_t)d3d12->sprites.capacity))
-            goto next_line;
-
-         lx          = xi;
-         ly          = roundf((1.0f - (y - (float)line_idx * line_height)) * height);
-         line_v_first = v;
-
-         for (i = 0; i < line_len; i++)
-         {
-            const struct font_glyph *glyph;
-            const char *msg_tmp = &line_start[i];
-            unsigned    code    = utf8_walk(&msg_tmp);
-            unsigned    skip    = msg_tmp - &line_start[i];
-
-            float       gx, gy, gw, gh;
-            float       gu, gv, gtw, gth;
-
-            if (skip > 1)
-               i += skip - 1;
-
-            if (!(glyph = get_glyph(font_data, code)))
-               if (!(glyph = glyph_q))
-                  continue;
-
-            /* Compute position and texcoord once, reuse for shadow. */
-            gx  = (lx + (glyph->draw_offset_x * scale)) * inv_vp_w;
-            gy  = (ly + (glyph->draw_offset_y * scale)) * inv_vp_h;
-            gw  = glyph->width  * scale * inv_vp_w;
-            gh  = glyph->height * scale * inv_vp_h;
-
-            gu  = glyph->atlas_offset_x * inv_tex_w;
-            gv  = glyph->atlas_offset_y * inv_tex_h;
-            gtw = glyph->width          * inv_tex_w;
-            gth = glyph->height         * inv_tex_h;
-
-            /* Shadow sprite (emitted first for correct draw order). */
-            if (has_shadow)
-            {
-               v->pos.x           = gx + shadow_dx;
-               v->pos.y           = gy + shadow_dy;
-               v->pos.w           = gw;
-               v->pos.h           = gh;
-
-               v->coords.u        = gu;
-               v->coords.v        = gv;
-               v->coords.w        = gtw;
-               v->coords.h        = gth;
-
-               v->params.scaling  = 1;
-               v->params.rotation = 0;
-
-               v->colors[0]       = color_dark;
-               v->colors[1]       = color_dark;
-               v->colors[2]       = color_dark;
-               v->colors[3]       = color_dark;
-
-               v++;
-            }
-
-            /* Foreground sprite. */
-            v->pos.x           = gx;
-            v->pos.y           = gy;
-            v->pos.w           = gw;
-            v->pos.h           = gh;
-
-            v->coords.u        = gu;
-            v->coords.v        = gv;
-            v->coords.w        = gtw;
-            v->coords.h        = gth;
-
-            v->params.scaling  = 1;
-            v->params.rotation = 0;
-
-            v->colors[0]       = color;
-            v->colors[1]       = color;
-            v->colors[2]       = color;
-            v->colors[3]       = color;
-
-            v++;
-
-            lx                += glyph->advance_x * scale;
-            ly                += glyph->advance_y * scale;
-         }
-
-         /* Retroactive alignment shift — adjusts both shadow and
-          * foreground sprites since they are interleaved. */
-         if (text_align != TEXT_ALIGN_LEFT)
-         {
-            int             total_advance = lx - xi;
-            float           shift;
-            d3d12_sprite_t *s;
-
-            if (text_align == TEXT_ALIGN_RIGHT)
-               shift = (float)total_advance * inv_vp_w;
-            else
-               shift = (float)(total_advance / 2) * inv_vp_w;
-
-            for (s = line_v_first; s < v; s++)
-               s->pos.x -= shift;
-         }
-
-next_line:
-         if (!*p)
-            break;
-         line_start = p + 1;
-         line_idx++;
-      }
+#define FONT_LAYOUT_ALIGNED 0
+      /* A line too long for the sprite buffer is not looked up either */
+#define FONT_LAYOUT_SKIP(line, bytes) ((bytes) > line_cap)
+#define FONT_LAYOUT_LINE(line, line_width, count, bytes) \
+      do \
+      { \
+         (void)(line_width); \
+         (void)(count); \
+         line_ok      = ((bytes) <= line_cap); \
+         lx           = xi; \
+         ly           = roundf((1.0f - (y - (float)(line) * line_height)) \
+               * height); \
+         line_v_first = v; \
+      } while (0)
+#define FONT_LAYOUT_GLYPH(glyph, pen_x, pen_y) \
+      do \
+      { \
+         float gx, gy, gw, gh, gu, gv, gtw, gth; \
+         /* This driver keeps its own truncating pen */ \
+         (void)(pen_x); \
+         (void)(pen_y); \
+         if (!line_ok) \
+            break; \
+         /* Position and texcoord once, shared with the shadow */ \
+         gx  = (lx + ((glyph)->draw_offset_x * scale)) * inv_vp_w; \
+         gy  = (ly + ((glyph)->draw_offset_y * scale)) * inv_vp_h; \
+         gw  = (glyph)->width  * scale * inv_vp_w; \
+         gh  = (glyph)->height * scale * inv_vp_h; \
+         gu  = (glyph)->atlas_offset_x * inv_tex_w; \
+         gv  = (glyph)->atlas_offset_y * inv_tex_h; \
+         gtw = (glyph)->width          * inv_tex_w; \
+         gth = (glyph)->height         * inv_tex_h; \
+         if (has_shadow) \
+         { \
+            v->pos.x           = gx + shadow_dx; \
+            v->pos.y           = gy + shadow_dy; \
+            v->pos.w           = gw; \
+            v->pos.h           = gh; \
+            v->coords.u        = gu; \
+            v->coords.v        = gv; \
+            v->coords.w        = gtw; \
+            v->coords.h        = gth; \
+            v->params.scaling  = 1; \
+            v->params.rotation = 0; \
+            v->colors[0]       = color_dark; \
+            v->colors[1]       = color_dark; \
+            v->colors[2]       = color_dark; \
+            v->colors[3]       = color_dark; \
+            v++; \
+         } \
+         v->pos.x           = gx; \
+         v->pos.y           = gy; \
+         v->pos.w           = gw; \
+         v->pos.h           = gh; \
+         v->coords.u        = gu; \
+         v->coords.v        = gv; \
+         v->coords.w        = gtw; \
+         v->coords.h        = gth; \
+         v->params.scaling  = 1; \
+         v->params.rotation = 0; \
+         v->colors[0]       = color; \
+         v->colors[1]       = color; \
+         v->colors[2]       = color; \
+         v->colors[3]       = color; \
+         v++; \
+         lx                += (glyph)->advance_x * scale; \
+         ly                += (glyph)->advance_y * scale; \
+      } while (0)
+#define FONT_LAYOUT_LINE_END() \
+      do \
+      { \
+         if (line_ok && text_align != TEXT_ALIGN_LEFT) \
+         { \
+            int total_advance = lx - xi; \
+            float shift; \
+            d3d12_sprite_t *s; \
+            if (text_align == TEXT_ALIGN_RIGHT) \
+               shift = (float)total_advance * inv_vp_w; \
+            else \
+               shift = (float)(total_advance / 2) * inv_vp_w; \
+            for (s = line_v_first; s < v; s++) \
+               s->pos.x -= shift; \
+         } \
+      } while (0)
+#include "../font_layout.h"
    }
 
    total_count = v - v_batch_start;
@@ -2190,6 +2495,12 @@ static uint32_t d3d12_get_flags(void *data)
 {
    uint32_t flags = 0;
 
+#if defined(HAVE_WINDOW) && defined(HAVE_MONITOR)
+   /* a borderless fullscreen toggle restyles the window; see
+    * d3d12_set_video_mode() */
+   if (win32_fullscreen_in_place())
+      BIT32_SET(flags, GFX_CTX_FLAGS_FULLSCREEN_IN_PLACE);
+#endif
    BIT32_SET(flags, GFX_CTX_FLAGS_CUSTOMIZABLE_FRAME_LATENCY);
    BIT32_SET(flags, GFX_CTX_FLAGS_MENU_FRAME_FILTERING);
    BIT32_SET(flags, GFX_CTX_FLAGS_OVERLAY_BEHIND_MENU_SUPPORTED);
@@ -3868,6 +4179,49 @@ static bool d3d12_gfx_init_pipelines(d3d12_video_t* d3d12)
       vs_code = NULL;
       ps_code = NULL;
    }
+   /* gfx_display meshes, read as stored: three floats, then two 16-bit
+    * and four 8-bit normalised integers. Without the pipeline or its
+    * constant ring meshes are streamed through draw() instead. */
+   {
+      static const char shader[] =
+#include "d3d_shaders/mesh_sm4.hlsl.h"
+         ;
+      static const D3D12_INPUT_ELEMENT_DESC inputElementDesc[] = {
+         { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0,
+            D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+         { "TEXCOORD", 0, DXGI_FORMAT_R16G16_UNORM, 0, 12,
+            D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+         { "COLOR", 0, DXGI_FORMAT_R8G8B8A8_UNORM, 0, 16,
+            D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+      };
+      if (     d3d_compile(shader, sizeof(shader), NULL, "VSMain", "vs_5_0", &vs_code)
+            && d3d_compile(shader, sizeof(shader), NULL, "PSMain", "ps_5_0", &ps_code))
+      {
+         desc.BlendState.RenderTarget[0]     = d3d12_blend_enable_desc;
+         desc.PrimitiveTopologyType          = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+         desc.InputLayout.pInputElementDescs = inputElementDesc;
+         desc.InputLayout.NumElements        = countof(inputElementDesc);
+         d3d12_init_pipeline(
+               d3d12->device, vs_code, ps_code, NULL, &desc,
+               &d3d12->mesh_pipe);
+      }
+      Release(vs_code);
+      Release(ps_code);
+      vs_code = NULL;
+      ps_code = NULL;
+      if (d3d12->mesh_pipe)
+      {
+         D3D12_RANGE read_range;
+         void *mapped = NULL;
+         d3d12->mesh_cb_va = d3d12_create_buffer(d3d12->device,
+               D3D12_MESH_CB_SIZE * D3D12_MESH_CB_SLOTS, &d3d12->mesh_cb);
+         read_range.Begin  = 0;
+         read_range.End    = 0;
+         if (     d3d12->mesh_cb
+               && SUCCEEDED(D3D12Map(d3d12->mesh_cb, 0, &read_range, &mapped)))
+            d3d12->mesh_cb_mapped = (uint8_t*)mapped;
+      }
+   }
    {
       static const char shader[] =
 #include "d3d_shaders/sprite_sm4.hlsl.h"
@@ -3928,144 +4282,11 @@ static bool d3d12_gfx_init_pipelines(d3d12_video_t* d3d12)
       gs_code = NULL;
    }
 
-   if (string_is_equal(settings->arrays.menu_driver, "xmb"))
-   {
-      {
-         static const char ribbon[] =
-#include "d3d_shaders/ribbon_sm4.hlsl.h"
-            ;
-         static const char ribbon_simple[] =
-#include "d3d_shaders/ribbon_simple_sm4.hlsl.h"
-            ;
-
-         D3D12_INPUT_ELEMENT_DESC inputElementDesc[] = {
-            { "POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0,
-               D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
-         };
-
-         desc.BlendState.RenderTarget[0].SrcBlend  = D3D12_BLEND_DEST_COLOR;
-         desc.BlendState.RenderTarget[0].DestBlend = D3D12_BLEND_ONE;
-         desc.PrimitiveTopologyType                = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-         desc.InputLayout.pInputElementDescs       = inputElementDesc;
-         desc.InputLayout.NumElements              = countof(inputElementDesc);
-
-         if (!d3d_compile(ribbon, sizeof(ribbon), NULL, "VSMain", "vs_5_0", &vs_code))
-            goto error;
-         if (!d3d_compile(ribbon, sizeof(ribbon), NULL, "PSMain", "ps_5_0", &ps_code))
-            goto error;
-
-         d3d12_init_pipeline(
-               d3d12->device, vs_code, ps_code, NULL, &desc, &d3d12->pipes[VIDEO_SHADER_MENU]);
-
-         Release(vs_code);
-         Release(ps_code);
-         vs_code = NULL;
-         ps_code = NULL;
-
-         if (!d3d_compile(ribbon_simple, sizeof(ribbon_simple), NULL, "VSMain", "vs_5_0", &vs_code))
-            goto error;
-         if (!d3d_compile(ribbon_simple, sizeof(ribbon_simple), NULL, "PSMain", "ps_5_0", &ps_code))
-            goto error;
-
-         d3d12_init_pipeline(
-               d3d12->device, vs_code, ps_code, NULL, &desc, &d3d12->pipes[VIDEO_SHADER_MENU_2]);
-
-         Release(vs_code);
-         Release(ps_code);
-         vs_code = NULL;
-         ps_code = NULL;
-      }
-
-      {
-         static const char simple_snow[] =
-#include "d3d_shaders/simple_snow_sm4.hlsl.h"
-            ;
-         static const char snow[] =
-#include "d3d_shaders/snow_sm4.hlsl.h"
-            ;
-         static const char bokeh[] =
-#include "d3d_shaders/bokeh_sm4.hlsl.h"
-            ;
-         static const char snowflake[] =
-#include "d3d_shaders/snowflake_sm4.hlsl.h"
-            ;
-
-         D3D12_INPUT_ELEMENT_DESC inputElementDesc[] = {
-            { "POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, offsetof(d3d12_vertex_t, position),
-               D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
-            { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, offsetof(d3d12_vertex_t, texcoord),
-               D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
-         };
-
-         desc.PrimitiveTopologyType          = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-         desc.InputLayout.pInputElementDescs = inputElementDesc;
-         desc.InputLayout.NumElements        = countof(inputElementDesc);
-
-         /* Reset blend state to standard alpha blending for snow/bokeh/snowflake
-          * pipelines.  The ribbon shaders above set SrcBlend = DEST_COLOR /
-          * DestBlend = ONE which is a multiplicative blend unsuitable for
-          * additive particle effects — white snowflakes become invisible
-          * against coloured backgrounds. */
-         desc.BlendState.RenderTarget[0].SrcBlend       = D3D12_BLEND_SRC_ALPHA;
-         desc.BlendState.RenderTarget[0].DestBlend      = D3D12_BLEND_INV_SRC_ALPHA;
-         desc.BlendState.RenderTarget[0].BlendOp        = D3D12_BLEND_OP_ADD;
-         desc.BlendState.RenderTarget[0].SrcBlendAlpha  = D3D12_BLEND_SRC_ALPHA;
-         desc.BlendState.RenderTarget[0].DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
-         desc.BlendState.RenderTarget[0].BlendOpAlpha   = D3D12_BLEND_OP_ADD;
-
-         if (!d3d_compile(simple_snow, sizeof(simple_snow), NULL, "VSMain", "vs_5_0", &vs_code))
-            goto error;
-         if (!d3d_compile(simple_snow, sizeof(simple_snow), NULL, "PSMain", "ps_5_0", &ps_code))
-            goto error;
-
-         d3d12_init_pipeline(
-               d3d12->device, vs_code, ps_code, NULL, &desc, &d3d12->pipes[VIDEO_SHADER_MENU_3]);
-
-         Release(vs_code);
-         Release(ps_code);
-         vs_code = NULL;
-         ps_code = NULL;
-
-         if (!d3d_compile(snow, sizeof(snow), NULL, "VSMain", "vs_5_0", &vs_code))
-            goto error;
-         if (!d3d_compile(snow, sizeof(snow), NULL, "PSMain", "ps_5_0", &ps_code))
-            goto error;
-
-         d3d12_init_pipeline(
-               d3d12->device, vs_code, ps_code, NULL, &desc, &d3d12->pipes[VIDEO_SHADER_MENU_4]);
-
-         Release(vs_code);
-         Release(ps_code);
-         vs_code = NULL;
-         ps_code = NULL;
-
-         if (!d3d_compile(bokeh, sizeof(bokeh), NULL, "VSMain", "vs_5_0", &vs_code))
-            goto error;
-         if (!d3d_compile(bokeh, sizeof(bokeh), NULL, "PSMain", "ps_5_0", &ps_code))
-            goto error;
-
-         d3d12_init_pipeline(
-               d3d12->device, vs_code, ps_code, NULL, &desc, &d3d12->pipes[VIDEO_SHADER_MENU_5]);
-
-         Release(vs_code);
-         Release(ps_code);
-         vs_code = NULL;
-         ps_code = NULL;
-
-         if (!d3d_compile(snowflake, sizeof(snowflake), NULL, "VSMain", "vs_5_0", &vs_code))
-            goto error;
-         if (!d3d_compile(snowflake, sizeof(snowflake), NULL, "PSMain", "ps_5_0", &ps_code))
-            goto error;
-
-         d3d12_init_pipeline(
-               d3d12->device, vs_code, ps_code, NULL, &desc, &d3d12->pipes[VIDEO_SHADER_MENU_6]);
-
-         Release(vs_code);
-         Release(ps_code);
-         vs_code = NULL;
-         ps_code = NULL;
-      }
-   }
+   /* The menu effects are made from this when first drawn; see
+    * d3d12_effect_pipe */
+   d3d12->effect_desc       = desc;
+   d3d12->effect_desc_valid = true;
+   d3d12->effects_tried     = 0;
 
    {
       static const char shader[] =
@@ -4098,6 +4319,7 @@ static void d3d12_hw_ring_free(d3d12_video_t *d3d12);
 static void d3d12_gfx_free(void* data)
 {
    unsigned       i;
+   bool window_kept     = false;
    d3d12_video_t* d3d12 = (d3d12_video_t*)data;
 
    if (!d3d12)
@@ -4122,7 +4344,20 @@ static void d3d12_gfx_free(void* data)
    d3d12_free_shader_preset(d3d12);
 
    Release(d3d12->sprites.vbo);
-   Release(d3d12->menu_pipeline_vbo);
+   Release(d3d12->mesh_pipe);
+   Release(d3d12->mesh_cb);
+   d3d12->mesh_cb_mapped = NULL;
+   {
+      unsigned m;
+      for (m = 0; m < ARRAY_SIZE(d3d12->meshes); m++)
+      {
+         Release(d3d12->meshes[m].vbo);
+         d3d12->meshes[m].id = 0;
+      }
+      for (m = 0; m < d3d12->meshes_retired_count; m++)
+         Release(d3d12->meshes_retired[m].vbo);
+      d3d12->meshes_retired_count = 0;
+   }
 
    /* Cached SW framebuffer upload buffer (lazily allocated by
     * d3d12_sw_fb_ensure on first GET_CURRENT_SOFTWARE_FRAMEBUFFER
@@ -4198,6 +4433,31 @@ static void d3d12_gfx_free(void* data)
    Release(d3d12->chain.renderTargets[0]);
    Release(d3d12->chain.renderTargets[1]);
 
+#if defined(HAVE_WINDOW) && defined(HAVE_MONITOR)
+   /* The swap chain goes here. For years it was not released at all:
+    * the Release() that used to sit after the queue's was compiled
+    * out under a note that it crashed eventually, and every driver
+    * that was freed left its swap chain behind. It is released in the
+    * order that has been seen to hold: the queue was drained at the
+    * top of this function, the back buffers were let go of just
+    * above, the swap chain is told it is windowed (it always is;
+    * releasing one that is not is an error), and it is released while
+    * the queue it was made on is still there.
+    *
+    * It has to go for the window to be kept: DXGI makes no second
+    * flip-model swap chain on a window that still has one, and the
+    * window is left up for the next D3D12 driver where it can be
+    * (win32_window_keep()). */
+   window_kept = win32_window_keep();
+   if (d3d12->chain.handle)
+   {
+      d3d12->chain.handle->lpVtbl->SetFullscreenState(
+            d3d12->chain.handle, FALSE, NULL);
+      Release(d3d12->chain.handle);
+      d3d12->chain.handle = NULL;
+   }
+#endif
+
    Release(d3d12->queue.fence);
    Release(d3d12->queue.cmd);
    Release(d3d12->queue.allocator);
@@ -4206,9 +4466,14 @@ static void d3d12_gfx_free(void* data)
    if (d3d12->queue.fenceEvent)
       CloseHandle(d3d12->queue.fenceEvent);
 
+#if !(defined(HAVE_WINDOW) && defined(HAVE_MONITOR))
 #if 0
-   /* Releasing this will crash eventually (?!) */
+   /* Releasing this will crash eventually (?!)
+    * (On a build with a window it is released above, before the
+    * queue; this is what is left for the builds without - UWP -
+    * where that order has not been run.) */
    Release(d3d12->chain.handle);
+#endif
 #endif
 
    Release(d3d12->factory);
@@ -4232,12 +4497,15 @@ static void d3d12_gfx_free(void* data)
    video_driver_modify_disp_flags(0, VIDEO_FLAG_HDR_SUPPORT | VIDEO_FLAG_HDR10_SUPPORT | VIDEO_FLAG_SCRGB_SUPPORT);
 #endif
 
+   if (!window_kept)
+   {
 #ifdef HAVE_MONITOR
-   win32_monitor_from_window();
+      win32_monitor_from_window();
 #endif
 #ifdef HAVE_WINDOW
-   win32_destroy_window();
+      win32_destroy_window();
 #endif
+   }
 
    free(d3d12);
 }
@@ -4993,16 +5261,15 @@ static void *d3d12_gfx_init(const video_info_t* video,
 #endif
 #ifdef HAVE_MONITOR
    win32_monitor_init();
-   wndclass.lpfnWndProc = wnd_proc_d3d_common;
-#ifdef HAVE_DINPUT
-   if (string_is_equal(settings->arrays.input_driver, "dinput"))
-      wndclass.lpfnWndProc = wnd_proc_d3d_dinput;
-#endif
-#ifdef HAVE_WINRAWINPUT
-   if (string_is_equal(settings->arrays.input_driver, "raw"))
-      wndclass.lpfnWndProc = wnd_proc_d3d_winraw;
-#endif
+   /* one window procedure for every video and input driver; the
+    * family says what creating the window sets up */
+   wndclass.lpfnWndProc = win32_window_proc;
+   win32_window_proc_setup(WIN32_WINDOW_D3D);
 #ifdef HAVE_WINDOW
+   /* the window may be left up for the next D3D12 driver, and taken
+    * from the last: d3d12_gfx_free() and the swap chain's creation
+    * below do what that needs */
+   win32_window_tag("d3d12");
    win32_window_init(&wndclass, true, NULL);
 #endif
 
@@ -5045,8 +5312,9 @@ static void *d3d12_gfx_init(const video_info_t* video,
    else
       d3d12->flags &= ~D3D12_ST_FLAG_VSYNC;
 
-   d3d_input_driver(settings->arrays.input_driver,
-         settings->arrays.input_joypad_driver, input, input_data);
+   /* no input driver of this driver's own: the frontend starts the
+    * one that goes with a Windows window */
+   input_driver_left_to_frontend(INPUT_WINDOW_WINDOWS, input, input_data);
 
    d3d12_init_base(d3d12);
 
@@ -5065,7 +5333,21 @@ static void *d3d12_gfx_init(const video_info_t* video,
       goto error;
 #else
    if (!d3d12_init_swapchain(d3d12, VIDEO_SCALE_W(d3d12->vp.full_dims), VIDEO_SCALE_H(d3d12->vp.full_dims), main_window.hwnd))
-      goto error;
+   {
+#if defined(HAVE_WINDOW) && defined(HAVE_MONITOR)
+      /* On a window the last driver left up, DXGI may refuse a swap
+       * chain - something of the old one is still alive on it. Then
+       * the window is not worth having: a new one, and once more. */
+      if (     !win32_window_was_taken()
+            || !win32_window_remake(d3d12, d3d12->vp.full_dims,
+                  video->fullscreen)
+            || !d3d12_init_swapchain(d3d12,
+                  VIDEO_SCALE_W(d3d12->vp.full_dims),
+                  VIDEO_SCALE_H(d3d12->vp.full_dims),
+                  main_window.hwnd))
+#endif
+         goto error;
+   }
 #endif
 
 #ifdef HAVE_DXGI_HDR
@@ -5768,23 +6050,37 @@ static unsigned d3d12_present_last(void *data)
 /* The display timestamp of the most recent present, from DXGI's frame
  * statistics, on the QPC clock cpu_features_get_time_usec() keeps on
  * Windows. 0 when the swapchain cannot say. */
+/* The vblank the most recent present went out on, for display pacing.
+ * The swapchain's statistics say so only while they describe that
+ * present: a present made with sync interval 0, tearing allowed, is on
+ * no vblank, and leaves them at the last one that was - a time the
+ * presenter would step forward by a rounded period, drifting off the
+ * display's grid the longer it stays. Then, and whenever the statistics
+ * cannot be had, the compositor's own last vblank, as the Vulkan
+ * driver reads it on Windows. */
 static retro_time_t d3d12_get_last_present_time(void *data)
 {
    DXGI_FRAME_STATISTICS stats;
+   UINT last_present    = 0;
    static LARGE_INTEGER freq;
    d3d12_video_t *d3d12 = (d3d12_video_t*)data;
 
    if (!d3d12 || !d3d12->chain.handle)
       return 0;
-   if (FAILED(d3d12->chain.handle->lpVtbl->GetFrameStatistics(
-               d3d12->chain.handle, &stats)))
-      return 0;
-   if (!stats.SyncQPCTime.QuadPart)
-      return 0;
-   if (!freq.QuadPart && !QueryPerformanceFrequency(&freq))
-      return 0;
-   return (stats.SyncQPCTime.QuadPart / freq.QuadPart * 1000000)
-        + (stats.SyncQPCTime.QuadPart % freq.QuadPart * 1000000 / freq.QuadPart);
+   if (     SUCCEEDED(d3d12->chain.handle->lpVtbl->GetFrameStatistics(
+               d3d12->chain.handle, &stats))
+         && SUCCEEDED(d3d12->chain.handle->lpVtbl->GetLastPresentCount(
+               d3d12->chain.handle, &last_present))
+         && stats.PresentCount == last_present
+         && stats.SyncQPCTime.QuadPart
+         && (freq.QuadPart || QueryPerformanceFrequency(&freq)))
+      return (stats.SyncQPCTime.QuadPart / freq.QuadPart * 1000000)
+           + (stats.SyncQPCTime.QuadPart % freq.QuadPart * 1000000 / freq.QuadPart);
+#if !defined(__WINRT__) && !defined(_XBOX)
+   return win32_dwm_last_vblank_time();
+#else
+   return 0;
+#endif
 }
 
 static void dx12_inject_black_frame(d3d12_video_t* d3d12)
@@ -8860,11 +9156,33 @@ static unsigned d3d12_get_swap_interval_cap(void *data)
    return 4;
 }
 
+/* A borderless fullscreen toggle. It used to restart every driver:
+ * this one freed its device, queue, pipelines, shaders, swap chain and
+ * every texture and made them all again, the audio driver stopped and
+ * started, and a hardware-rendered core was told its context was gone
+ * - for a change of the window's style and size. The window is
+ * restyled where it stands instead (win32_window_set_fullscreen());
+ * the size change reaches the driver through check_window like any
+ * resize, and the swap chain's buffers are resized as they are when
+ * the window's edge is dragged. Nothing else is touched.
+ * RETROARCH_FULLSCREEN_IN_PLACE=0 turns it off. */
+#if defined(HAVE_WINDOW) && defined(HAVE_MONITOR)
+static void d3d12_set_video_mode(void *data, unsigned dims, bool fullscreen)
+{
+   (void)data;
+   win32_window_set_fullscreen(dims, fullscreen);
+}
+#endif
+
 static const video_poke_interface_t d3d12_poke_interface = {
    d3d12_get_flags,
    d3d12_gfx_load_texture,
    d3d12_gfx_unload_texture,
+#if defined(HAVE_WINDOW) && defined(HAVE_MONITOR)
+   d3d12_set_video_mode,
+#else
    NULL, /* set_video_mode */
+#endif
 #ifdef __WINRT__
    /* UWP does not expose this information easily */
    NULL,
@@ -8993,5 +9311,6 @@ gfx_display_ctx_driver_t gfx_display_ctx_d3d12 = {
    true,
    true,
    gfx_display_d3d12_scissor_begin,
-   gfx_display_d3d12_scissor_end
+   gfx_display_d3d12_scissor_end,
+   gfx_display_d3d12_mesh_draw
 };

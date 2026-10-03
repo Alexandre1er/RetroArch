@@ -31,6 +31,7 @@
 #endif
 
 #include "../common/wayland_common.h"
+#include "../common/wayland_resize.h"
 #include "../gfx/video_driver.h"
 #include "../../frontend/frontend_driver.h"
 #include "../../input/common/wayland_common.h"
@@ -40,7 +41,6 @@
 
 #ifdef HAVE_EGL
 #include <wayland-egl.h>
-#include <poll.h>
 #include "../common/egl_common.h"
 #endif
 
@@ -54,7 +54,6 @@
 
 #ifdef WEBOS
 extern void gfx_ctx_wl_get_video_size_webos(void*, unsigned*);
-extern void gfx_ctx_wl_destroy_resources_webos(gfx_ctx_wayland_data_t*);
 extern void gfx_ctx_wl_update_title_webos(void*);
 extern bool gfx_ctx_wl_init_webos(driver_configure_handler_t, gfx_ctx_wayland_data_t**);
 extern bool gfx_ctx_wl_set_video_mode_common_size_webos(gfx_ctx_wayland_data_t*, unsigned, unsigned, bool);
@@ -63,7 +62,6 @@ extern bool gfx_ctx_wl_suppress_screensaver_webos(void*, bool);
 extern void gfx_ctx_wl_check_window_webos(gfx_ctx_wayland_data_t*, void (*)(void*, unsigned*), bool*, bool*, unsigned*);
 
 #define gfx_ctx_wl_get_video_size_common gfx_ctx_wl_get_video_size_webos
-#define gfx_ctx_wl_destroy_resources_common gfx_ctx_wl_destroy_resources_webos
 #define gfx_ctx_wl_update_title_common gfx_ctx_wl_update_title_webos
 #define gfx_ctx_wl_init_common gfx_ctx_wl_init_webos
 #define gfx_ctx_wl_set_video_mode_common_size gfx_ctx_wl_set_video_mode_common_size_webos
@@ -110,11 +108,6 @@ static void gfx_ctx_wl_destroy_resources(gfx_ctx_wayland_data_t *wl)
 
    if (wl->win)
       wl_egl_window_destroy(wl->win);
-#endif
-
-   gfx_ctx_wl_destroy_resources_common(wl);
-
-#ifdef HAVE_EGL
    wl->win          = NULL;
 #endif
 }
@@ -132,10 +125,8 @@ static bool gfx_ctx_wl_set_resize(void *data, unsigned dims)
    gfx_ctx_wayland_data_t *wl    = (gfx_ctx_wayland_data_t*)data;
    wl->last_buffer_scale         = wl->buffer_scale;
    wl->last_fractional_scale_num = wl->fractional_scale_num;
-   if (!wl->fractional_scale &&
-       wl_compositor_get_version(wl->compositor) >=
-       WL_SURFACE_SET_BUFFER_SCALE_SINCE_VERSION)
-      wl->ignore_configuration = false;
+   wl_surface_resized(wl->surface, wl->fractional_scale != NULL,
+         wl->buffer_scale, &wl->ignore_configuration);
 #ifdef HAVE_EGL
    wl_egl_window_resize(wl->win, VIDEO_SCALE_W(dims), VIDEO_SCALE_H(dims), 0, 0);
 #endif
@@ -372,8 +363,7 @@ static void *gfx_ctx_wl_init(void *data)
    return wl;
 error:
    gfx_ctx_wl_destroy_resources(wl);
-   if (wl)
-      free(wl);
+   gfx_ctx_wl_free_common(wl, false);
    return NULL;
 }
 
@@ -465,8 +455,7 @@ static void gfx_ctx_wl_destroy(void *data)
          | VIDEO_FLAG_HDR10_SUPPORT
          | VIDEO_FLAG_SCRGB_SUPPORT);
    gfx_ctx_wl_destroy_resources(wl);
-
-   free(wl);
+   gfx_ctx_wl_free_common(wl, true);
 }
 
 static void gfx_ctx_wl_set_swap_interval(void *data, int swap_interval)
@@ -494,14 +483,16 @@ static bool gfx_ctx_wl_set_video_mode(void *data,
    unsigned width  = VIDEO_SCALE_W(dims);
    unsigned height = VIDEO_SCALE_H(dims);
    gfx_ctx_wayland_data_t *wl   = (gfx_ctx_wayland_data_t*)data;
+#ifdef HAVE_EGL
+   EGLint egl_attribs[16];
+   EGLint *attr;
+#endif
 
    if (!gfx_ctx_wl_set_video_mode_common_size(wl, width, height, fullscreen))
       goto error;
 
 #ifdef HAVE_EGL
-   EGLint egl_attribs[16];
-   EGLint *attr              = egl_fill_attribs(
-         (gfx_ctx_wayland_data_t*)data, egl_attribs);
+   attr                      = egl_fill_attribs(wl, egl_attribs);
 
    /* Set buffer scale before creating wl_egl_window.
     * Fixes incorrect size/offset on HiDPI/fullscreen. */
@@ -510,6 +501,9 @@ static bool gfx_ctx_wl_set_video_mode(void *data,
        WL_SURFACE_SET_BUFFER_SCALE_SINCE_VERSION)
       wl_surface_set_buffer_scale(wl->surface, wl->buffer_scale);
 
+   /* A configure handled before this may have made one already */
+   if (wl->win)
+      wl_egl_window_destroy(wl->win);
    wl->win = wl_egl_window_create(wl->surface,
       VIDEO_SCALE_W(wl->buffer_dims),
       VIDEO_SCALE_H(wl->buffer_dims));
@@ -623,26 +617,9 @@ static bool gfx_ctx_wl_bind_api(void *data,
    return false;
 }
 
-static void wl_surface_frame_done(void *data, struct wl_callback *cb, uint32_t time)
-{
-   gfx_ctx_wayland_data_t *wl = (gfx_ctx_wayland_data_t*)data;
-
-   wl->swap_complete = true;
-   if (wl->frame_cb == cb)
-      wl->frame_cb   = NULL;
-
-   /* Destroy this callback */
-   wl_callback_destroy(cb);
-}
-
-static const struct wl_callback_listener wl_surface_frame_listener = {
-   .done = wl_surface_frame_done,
-};
-
 static void gfx_ctx_wl_swap_buffers(void *data)
 {
 #ifdef HAVE_EGL
-   struct wl_callback *cb         = NULL;
    gfx_ctx_wayland_data_t *wl     = (gfx_ctx_wayland_data_t*)data;
    settings_t *settings           = config_get_ptr();
    unsigned max_swapchain_images  = settings->uints.video_max_swapchain_images;
@@ -662,21 +639,15 @@ static void gfx_ctx_wl_swap_buffers(void *data)
       && !wl->suspended;
 
    if (frame_throttle)
-   {
-      /* Set Wayland frame callback. */
-      cb = wl_surface_frame(wl->surface);
-      wl_callback_add_listener(cb, &wl_surface_frame_listener, wl);
-      wl->frame_cb = cb;
-   }
+      wl_frame_request(&wl->frame, wl->input.dpy, wl->surface);
 
-   if (wl->present_clock)
-      wl_presentation_dispatch_pending(wl);
+   if (wl->present.clock)
+      wl_present_dispatch(&wl->present, wl->input.dpy);
 
    /* Skip presentation-time pacing and feedback while the surface is
     * suspended: the compositor is not scanning out the surface, so
     * there are no vblank events to track and requesting feedback for
-    * a frame that will not be displayed is wasteful.  Keep the event
-    * queue moving (dispatch above) so the resume configure is seen. */
+    * a frame that will not be displayed is wasteful. */
    if (!wl->suspended)
    {
       /* The EGL frame-callback throttle above already paces to the
@@ -684,52 +655,17 @@ static void gfx_ctx_wl_swap_buffers(void *data)
        * of it double-throttles the frame, so only pace here when that
        * throttle is not engaged (e.g. >2 max swapchain images). */
       if (!frame_throttle)
-         wait_for_next_frame(wl);
+         wl_present_wait(&wl->present, wl->swap_interval);
 
-      if (wl->present_clock)
-         wl_request_presentation_feedback(wl);
+      if (wl->present.clock)
+         wl_present_request(&wl->present, wl->surface);
    }
 
    egl_swap_buffers(&wl->egl);
 
    if (frame_throttle)
-   {
-      /* Wait for the frame callback we set earlier. */
-      struct pollfd pollfd = {.fd = wl->input.fd, .events = POLLIN};
-      uint64_t deadline = cpu_features_get_time_usec() + 50000;
-      wl->swap_complete = false;
-
-      while (!wl->swap_complete)
-      {
-         uint64_t current_time = cpu_features_get_time_usec();
-         if (current_time >= deadline)
-         {
-            /* Deadline met. */
-            wl_callback_destroy(cb);
-            wl->frame_cb = NULL;
-            return;
-         }
-         uint64_t remaining_time = deadline - current_time;
-         int ret = (wl_display_dispatch_pending(wl->input.dpy));
-         if (ret == 0)
-         {
-            ret = wl_display_prepare_read(wl->input.dpy);
-            if (ret == -1)
-               continue; /* Retry dispatch_pending. */
-
-            ret = poll(&pollfd, 1, remaining_time / 1000);
-            if (ret <= 0)
-            {
-               /* Timeout met, or polling error. */
-               wl_display_cancel_read(wl->input.dpy);
-               wl_callback_destroy(cb);
-               wl->frame_cb = NULL;
-               return;
-            }
-            wl_display_read_events(wl->input.dpy);
-         }
-      }
-   }
+      wl_frame_wait(&wl->frame, wl->input.dpy,
+            cpu_features_get_time_usec() + 50000);
 #endif
 }
 

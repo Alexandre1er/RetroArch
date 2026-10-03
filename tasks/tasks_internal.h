@@ -100,7 +100,10 @@ void task_window_progress_cb(retro_task_t *task);
 typedef struct
 {
    char *data;
-   struct string_list *headers;
+   /* Response headers, one block of NUL-terminated "Name: value"
+    * lines ending in an empty line; walk with net_http_header_next().
+    * Owned here, freed with free(). */
+   char *headers;
    size_t len;
    int status;
 } http_transfer_data_t;
@@ -222,12 +225,29 @@ bool task_push_keychain_passphrase(const char *passphrase);
  * name will be determined automatically
  * > core_display_name *must* be set to a non-empty
  *   string if task_push_core_backup() is *not* called
- *   on the main thread */
+ *   on the main thread
+ * NOTE 3: @cb, if set, is called with @user_data when the
+ * task retires, on the thread that retires the queue, once
+ * for every task this returns */
 void *task_push_core_backup(
       const char *core_path, const char *core_display_name,
       uint32_t crc, enum core_backup_mode backup_mode,
       size_t auto_backup_history_size,
-      const char *dir_core_assets, bool mute);
+      const char *dir_core_assets, bool mute,
+      retro_task_callback_t cb, void *user_data);
+
+/* An automatic backup that also installs a new core: @staged_path,
+ * extracted on the same volume as @core_path, replaces @core_path,
+ * and the core it replaces is moved into the backups as it is rather
+ * than compressed into them; where it cannot be moved it is copied as
+ * task_push_core_backup() would.  @cb gets an error exactly when the
+ * new core could not be installed. */
+void *task_push_core_backup_install(
+      const char *core_path, const char *staged_path,
+      const char *core_display_name, uint32_t crc,
+      size_t auto_backup_history_size,
+      const char *dir_core_assets, bool mute,
+      retro_task_callback_t cb, void *user_data);
 
 /* NOTE: If 'core_loaded' is true, menu stack should be
  * flushed if task_push_core_restore() returns true */
@@ -284,12 +304,10 @@ bool task_push_icon_load(const char *fullpath,
       uint64_t *generation_ptr);
 
 #ifdef HAVE_LIBRETRODB
-bool task_push_dbscan(
-      const char *playlist_directory,
-      const char *content_database,
-      const char *fullpath,
-      bool directory, bool show_hidden_files,
-      retro_task_callback_t cb);
+/* Scans @fullpath, a directory or a single file, against the content
+ * databases; the database and playlist directories come from the
+ * settings. */
+bool task_push_dbscan(const char *fullpath, retro_task_callback_t cb);
 #endif
 
 bool task_push_manual_content_scan(
@@ -408,6 +426,9 @@ bool input_autoconfigure_connect_ex(
 bool input_autoconfigure_disconnect(
       unsigned port, const char *name);
 bool input_autoconfigure_reconnect(unsigned port);
+#ifdef HAVE_TEST_DRIVERS
+bool input_autoconfigure_pending(void);
+#endif
 
 void set_save_state_in_background(bool state);
 void set_save_state_disable_undo(bool disable);

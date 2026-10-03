@@ -371,7 +371,11 @@ enum display_flags
    /* Set by a context driver whose default framebuffer is 10-bit
     * Rec.2020 PQ (HDR10, e.g. a KMS scanout with HDR metadata): the
     * video driver encodes its frame to PQ instead of scRGB. */
-   GFX_CTX_FLAGS_HDR10_FRAMEBUFFER
+   GFX_CTX_FLAGS_HDR10_FRAMEBUFFER,
+   /* The window can go between windowed and borderless fullscreen where
+    * it stands, through set_video_mode, with the driver seeing only a
+    * resize: a fullscreen toggle need not restart the drivers. */
+   GFX_CTX_FLAGS_FULLSCREEN_IN_PLACE
 };
 
 enum shader_uniform_type
@@ -446,6 +450,14 @@ struct font_atlas
    unsigned dirty_y0;
    unsigned dirty_x1;
    unsigned dirty_y1;
+   /* Set by the consumer to the largest texture it can make. When a
+    * frame needs more glyphs than the atlas has cells for, the next
+    * get_atlas() call in a later frame grows the atlas - width and
+    * height, never past these - and the consumer remakes its texture at
+    * the new size. Zero, the default, keeps the atlas at its first
+    * size. Cells only ever get added: a glyph's offsets never change. */
+   unsigned max_width;
+   unsigned max_height;
    enum font_atlas_format format;
    bool dirty;
 };

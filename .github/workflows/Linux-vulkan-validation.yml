@@ -123,7 +123,7 @@ jobs:
 
     steps:
       - name: Install dependencies
-        timeout-minutes: 8
+        timeout-minutes: 20
         run: |
           pkgs="build-essential libxkbcommon-dev libx11-xcb-dev libxcb1-dev libxinerama-dev libxrandr-dev libxxf86vm-dev libxv-dev xvfb x11-utils zlib1g-dev libfreetype6-dev libvulkan-dev mesa-vulkan-drivers vulkan-validationlayers vulkan-tools libasound2-dev"
           for i in 1 2 3; do
@@ -132,12 +132,47 @@ jobs:
             echo "apt-get update failed (attempt $i); retrying in 10s"
             sleep 10
           done
+          # Fetch first, under a bound: a download is safe to stop and
+          # resumes, an install is not. A mirror that stalls is left for
+          # the main archive on the next attempt.
+          for i in 1 2 3; do
+            sudo timeout 240 apt-get install -y --download-only \
+              -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
+              $pkgs && break
+            [ $i = 3 ] && exit 1
+            echo "package download failed or stalled (attempt $i); retrying from archive.ubuntu.com"
+            for f in /etc/apt/sources.list /etc/apt/sources.list.d/*; do
+              [ -f "$f" ] || continue
+              sudo sed -i -e 's#mirror+file:/etc/apt/apt-mirrors.txt#http://archive.ubuntu.com/ubuntu/#g' \
+                -e 's#http://azure\.archive\.ubuntu\.com/ubuntu#http://archive.ubuntu.com/ubuntu#g' "$f"
+            done
+            sudo timeout 90 apt-get update -y \
+              -o Acquire::Retries=3 -o Acquire::http::Timeout=30 || true
+          done
           sudo apt-get install -y \
             -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
             $pkgs
 
       - name: Checkout
         uses: actions/checkout@v5
+
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ github.workflow }}-${{ github.job }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ github.workflow }}-${{ github.job }}-
+
+      - name: Enable ccache
+        run: |
+          set -eu
+          command -v ccache >/dev/null 2>&1 || sudo apt-get install -y -qq ccache
+          export CCACHE_DIR="$HOME/.ccache"
+          echo "CCACHE_DIR=$CCACHE_DIR" >> "$GITHUB_ENV"
+          echo "/usr/lib/ccache" >> "$GITHUB_PATH"
+          ccache -M 500M
+          ccache -z
 
       - name: Configure
         # Non-Qt, as the harness requires (with Qt, main() lives in
@@ -217,7 +252,7 @@ jobs:
 
     steps:
       - name: Install dependencies
-        timeout-minutes: 8
+        timeout-minutes: 20
         run: |
           pkgs="build-essential libx11-dev libx11-xcb-dev libxcb1-dev xvfb x11-utils libvulkan-dev mesa-vulkan-drivers vulkan-validationlayers vulkan-tools"
           for i in 1 2 3; do
@@ -225,6 +260,23 @@ jobs:
               -o Acquire::Retries=3 -o Acquire::http::Timeout=30 && break
             echo "apt-get update failed (attempt $i); retrying in 10s"
             sleep 10
+          done
+          # Fetch first, under a bound: a download is safe to stop and
+          # resumes, an install is not. A mirror that stalls is left for
+          # the main archive on the next attempt.
+          for i in 1 2 3; do
+            sudo timeout 240 apt-get install -y --download-only \
+              -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
+              $pkgs && break
+            [ $i = 3 ] && exit 1
+            echo "package download failed or stalled (attempt $i); retrying from archive.ubuntu.com"
+            for f in /etc/apt/sources.list /etc/apt/sources.list.d/*; do
+              [ -f "$f" ] || continue
+              sudo sed -i -e 's#mirror+file:/etc/apt/apt-mirrors.txt#http://archive.ubuntu.com/ubuntu/#g' \
+                -e 's#http://azure\.archive\.ubuntu\.com/ubuntu#http://archive.ubuntu.com/ubuntu#g' "$f"
+            done
+            sudo timeout 90 apt-get update -y \
+              -o Acquire::Retries=3 -o Acquire::http::Timeout=30 || true
           done
           sudo apt-get install -y \
             -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
@@ -264,7 +316,7 @@ jobs:
 
     steps:
       - name: Install dependencies
-        timeout-minutes: 8
+        timeout-minutes: 20
         run: |
           pkgs="build-essential libxkbcommon-dev libx11-xcb-dev libxcb1-dev libxinerama-dev libxrandr-dev libxxf86vm-dev libxv-dev xvfb x11-utils zlib1g-dev libfreetype6-dev libvulkan-dev mesa-vulkan-drivers vulkan-validationlayers vulkan-tools libasound2-dev"
           for i in 1 2 3; do
@@ -273,12 +325,47 @@ jobs:
             echo "apt-get update failed (attempt $i); retrying in 10s"
             sleep 10
           done
+          # Fetch first, under a bound: a download is safe to stop and
+          # resumes, an install is not. A mirror that stalls is left for
+          # the main archive on the next attempt.
+          for i in 1 2 3; do
+            sudo timeout 240 apt-get install -y --download-only \
+              -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
+              $pkgs && break
+            [ $i = 3 ] && exit 1
+            echo "package download failed or stalled (attempt $i); retrying from archive.ubuntu.com"
+            for f in /etc/apt/sources.list /etc/apt/sources.list.d/*; do
+              [ -f "$f" ] || continue
+              sudo sed -i -e 's#mirror+file:/etc/apt/apt-mirrors.txt#http://archive.ubuntu.com/ubuntu/#g' \
+                -e 's#http://azure\.archive\.ubuntu\.com/ubuntu#http://archive.ubuntu.com/ubuntu#g' "$f"
+            done
+            sudo timeout 90 apt-get update -y \
+              -o Acquire::Retries=3 -o Acquire::http::Timeout=30 || true
+          done
           sudo apt-get install -y \
             -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
             $pkgs
 
       - name: Checkout
         uses: actions/checkout@v5
+
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ github.workflow }}-${{ github.job }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ github.workflow }}-${{ github.job }}-
+
+      - name: Enable ccache
+        run: |
+          set -eu
+          command -v ccache >/dev/null 2>&1 || sudo apt-get install -y -qq ccache
+          export CCACHE_DIR="$HOME/.ccache"
+          echo "CCACHE_DIR=$CCACHE_DIR" >> "$GITHUB_ENV"
+          echo "/usr/lib/ccache" >> "$GITHUB_PATH"
+          ccache -M 500M
+          ccache -z
 
       - name: Configure
         run: |
@@ -314,7 +401,7 @@ jobs:
 
     steps:
       - name: Install dependencies
-        timeout-minutes: 8
+        timeout-minutes: 20
         run: |
           pkgs="build-essential libxkbcommon-dev libx11-xcb-dev libxcb1-dev libxinerama-dev libxrandr-dev libxxf86vm-dev libxv-dev xvfb x11-utils zlib1g-dev libfreetype6-dev libvulkan-dev mesa-vulkan-drivers vulkan-validationlayers vulkan-tools libasound2-dev"
           for i in 1 2 3; do
@@ -323,12 +410,47 @@ jobs:
             echo "apt-get update failed (attempt $i); retrying in 10s"
             sleep 10
           done
+          # Fetch first, under a bound: a download is safe to stop and
+          # resumes, an install is not. A mirror that stalls is left for
+          # the main archive on the next attempt.
+          for i in 1 2 3; do
+            sudo timeout 240 apt-get install -y --download-only \
+              -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
+              $pkgs && break
+            [ $i = 3 ] && exit 1
+            echo "package download failed or stalled (attempt $i); retrying from archive.ubuntu.com"
+            for f in /etc/apt/sources.list /etc/apt/sources.list.d/*; do
+              [ -f "$f" ] || continue
+              sudo sed -i -e 's#mirror+file:/etc/apt/apt-mirrors.txt#http://archive.ubuntu.com/ubuntu/#g' \
+                -e 's#http://azure\.archive\.ubuntu\.com/ubuntu#http://archive.ubuntu.com/ubuntu#g' "$f"
+            done
+            sudo timeout 90 apt-get update -y \
+              -o Acquire::Retries=3 -o Acquire::http::Timeout=30 || true
+          done
           sudo apt-get install -y \
             -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
             $pkgs
 
       - name: Checkout
         uses: actions/checkout@v5
+
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ github.workflow }}-${{ github.job }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ github.workflow }}-${{ github.job }}-
+
+      - name: Enable ccache
+        run: |
+          set -eu
+          command -v ccache >/dev/null 2>&1 || sudo apt-get install -y -qq ccache
+          export CCACHE_DIR="$HOME/.ccache"
+          echo "CCACHE_DIR=$CCACHE_DIR" >> "$GITHUB_ENV"
+          echo "/usr/lib/ccache" >> "$GITHUB_PATH"
+          ccache -M 500M
+          ccache -z
 
       - name: Configure
         run: |
@@ -368,7 +490,7 @@ jobs:
 
     steps:
       - name: Install dependencies
-        timeout-minutes: 8
+        timeout-minutes: 20
         run: |
           pkgs="build-essential libxkbcommon-dev libx11-xcb-dev libxcb1-dev libxinerama-dev libxrandr-dev libxxf86vm-dev libxv-dev xvfb x11-utils zlib1g-dev libfreetype6-dev libgl-dev libglx-dev libegl-dev libgles-dev libgl1-mesa-dri libglx-mesa0 mesa-utils libasound2-dev"
           for i in 1 2 3; do
@@ -377,12 +499,47 @@ jobs:
             echo "apt-get update failed (attempt $i); retrying in 10s"
             sleep 10
           done
+          # Fetch first, under a bound: a download is safe to stop and
+          # resumes, an install is not. A mirror that stalls is left for
+          # the main archive on the next attempt.
+          for i in 1 2 3; do
+            sudo timeout 240 apt-get install -y --download-only \
+              -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
+              $pkgs && break
+            [ $i = 3 ] && exit 1
+            echo "package download failed or stalled (attempt $i); retrying from archive.ubuntu.com"
+            for f in /etc/apt/sources.list /etc/apt/sources.list.d/*; do
+              [ -f "$f" ] || continue
+              sudo sed -i -e 's#mirror+file:/etc/apt/apt-mirrors.txt#http://archive.ubuntu.com/ubuntu/#g' \
+                -e 's#http://azure\.archive\.ubuntu\.com/ubuntu#http://archive.ubuntu.com/ubuntu#g' "$f"
+            done
+            sudo timeout 90 apt-get update -y \
+              -o Acquire::Retries=3 -o Acquire::http::Timeout=30 || true
+          done
           sudo apt-get install -y \
             -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
             $pkgs
 
       - name: Checkout
         uses: actions/checkout@v5
+
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ github.workflow }}-${{ github.job }}-${{ strategy.job-index }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ github.workflow }}-${{ github.job }}-${{ strategy.job-index }}-
+
+      - name: Enable ccache
+        run: |
+          set -eu
+          command -v ccache >/dev/null 2>&1 || sudo apt-get install -y -qq ccache
+          export CCACHE_DIR="$HOME/.ccache"
+          echo "CCACHE_DIR=$CCACHE_DIR" >> "$GITHUB_ENV"
+          echo "/usr/lib/ccache" >> "$GITHUB_PATH"
+          ccache -M 500M
+          ccache -z
 
       - name: Configure
         run: |

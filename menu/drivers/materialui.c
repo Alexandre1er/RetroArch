@@ -248,7 +248,6 @@ enum
    MUI_TEXTURE_MUSIC,
    MUI_TEXTURE_VIDEO,
    MUI_TEXTURE_QUIT,
-   MUI_TEXTURE_HELP,
    MUI_TEXTURE_HISTORY,
    MUI_TEXTURE_INFO,
    MUI_TEXTURE_ADD,
@@ -2205,8 +2204,6 @@ static const char *materialui_texture_path(unsigned id)
          return "archive.png";
       case MUI_TEXTURE_QUIT:
          return "quit.png";
-      case MUI_TEXTURE_HELP:
-         return "help.png";
       case MUI_TEXTURE_NETPLAY:
          return "netplay.png";
       case MUI_TEXTURE_CORES:
@@ -9757,6 +9754,8 @@ static void materialui_free(void *data)
    if (!mui)
       return;
 
+   /* Theme textures still uploading land nowhere */
+   gfx_display_texture_loads_cancel(mui, sizeof(*mui));
    /* Invalidate in-flight async icon loads */
    mui_icon_load_gen++;
 
@@ -9778,6 +9777,8 @@ static void materialui_context_bg_destroy(materialui_handle_t *mui)
    if (!mui)
       return;
 
+   gfx_display_texture_loads_cancel(&mui->textures.bg,
+         sizeof(mui->textures.bg));
    video_driver_texture_unload(&mui->textures.bg);
    gfx_display_deinit_white_texture();
 }
@@ -9814,6 +9815,9 @@ static void materialui_context_destroy(void *data)
 
    if (!mui)
       return;
+
+   /* Theme textures still uploading land nowhere */
+   gfx_display_texture_loads_cancel(mui, sizeof(*mui));
 
    /* Signal the render path to stop using textures/fonts.
     * Under threaded video, materialui_frame() may be mid-render
@@ -9864,7 +9868,7 @@ static bool materialui_load_image(void *userdata,
    if (type == MENU_IMAGE_WALLPAPER)
    {
       materialui_context_bg_destroy(mui);
-      video_driver_texture_load(data,
+      gfx_display_texture_load((struct texture_image*)data,
             gfx_display_texture_filter(), &mui->textures.bg);
       gfx_display_deinit_white_texture();
       gfx_display_init_white_texture();
@@ -12283,11 +12287,6 @@ static void materialui_list_insert(void *userdata,
                node->icon_texture_index = MUI_TEXTURE_HISTORY;
                node->icon_type          = MUI_ICON_TYPE_INTERNAL;
             }
-            else if (string_is_equal(label, MENU_ENUM_LABEL_HELP_LIST_STR))
-            {
-               node->icon_texture_index = MUI_TEXTURE_HELP;
-               node->icon_type          = MUI_ICON_TYPE_INTERNAL;
-            }
             else if (string_is_equal(label, MENU_ENUM_LABEL_RESTART_CONTENT_STR))
             {
                node->icon_texture_index = MUI_TEXTURE_RESTART;
@@ -12608,6 +12607,7 @@ static void materialui_list_insert(void *userdata,
                   || string_is_equal(label, MENU_ENUM_LABEL_AUDIO_MIXER_SETTINGS_STR)
                   || string_is_equal(label, MENU_ENUM_LABEL_MENU_SOUNDS_STR)
                   || string_is_equal(label, MENU_ENUM_LABEL_INPUT_SETTINGS_STR)
+                  || string_is_equal(label, MENU_ENUM_LABEL_INPUT_INFORMATION_STR)
                   || string_is_equal(label, MENU_ENUM_LABEL_INPUT_MENU_SETTINGS_STR)
                   || string_is_equal(label, MENU_ENUM_LABEL_INPUT_SENSOR_SETTINGS_STR)
                   || string_is_equal(label, MENU_ENUM_LABEL_INPUT_HAPTIC_FEEDBACK_SETTINGS_STR)
@@ -12628,6 +12628,9 @@ static void materialui_list_insert(void *userdata,
                   || string_is_equal(label, MENU_ENUM_LABEL_AI_SERVICE_SETTINGS_STR)
 #ifdef HAVE_SMBCLIENT
                   || string_is_equal(label, MENU_ENUM_LABEL_SMB_CLIENT_SETTINGS_STR)
+#endif
+#ifdef HAVE_NFSCLIENT
+                  || string_is_equal(label, MENU_ENUM_LABEL_NFS_CLIENT_SETTINGS_STR)
 #endif
                   || string_is_equal(label, MENU_ENUM_LABEL_ACCESSIBILITY_SETTINGS_STR)
                   || string_is_equal(label, MENU_ENUM_LABEL_POWER_MANAGEMENT_SETTINGS_STR)

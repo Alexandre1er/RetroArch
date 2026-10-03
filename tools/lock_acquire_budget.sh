@@ -110,6 +110,14 @@ measure audio/audio_thread_wrapper.o  audio_thread_loop
 # nothing in flight.
 measure libretro-common/queues/task_queue.o  retro_task_threaded_gather
 
+measure libretro-common/rthreads/tpool.o  tpool_worker
+measure libretro-common/rthreads/tpool.o  tpool_help
+measure libretro-common/rthreads/tpool.o  tpool_wait
+
+measure record/drivers/record_ffmpeg.o  ffmpeg_push_video
+measure record/drivers/record_ffmpeg.o  ffmpeg_push_audio
+measure record/drivers/record_ffmpeg.o  ffmpeg_thread
+
 # The frame and the batch. Neither takes a lock today, and the reason
 # to record that is how much runs under them.
 measure gfx/video_driver.o    video_driver_frame

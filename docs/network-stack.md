@@ -33,8 +33,12 @@ problem, and set it back afterwards.
 
 The SMB client connects to Windows shares, Samba and NAS devices using
 SMB 2.0.2 through 3.1.1. Messages are signed (a guest session has no key
-to sign with); when a server or share requires encryption, traffic is
-sealed with AES-CCM (SMB 3.0/3.0.2) or AES-GCM (SMB 3.1.1).
+to sign with): with AES-GMAC on SMB 3.1.1 when the server offers it
+(Samba 4.15 and later, Windows 11 and Server 2022), otherwise AES-CMAC,
+or HMAC-SHA256 on SMB 2. GMAC runs several times faster than CMAC at
+both ends, which matters where every read is signed, as Windows 11 24H2
+requires by default. When a server or share requires encryption, traffic
+is sealed with AES-CCM (SMB 3.0/3.0.2) or AES-GCM (SMB 3.1.1).
 Authentication is NTLMv2 with a user name and password, or Kerberos in
 an Active Directory domain.
 
@@ -52,8 +56,8 @@ Enable it under **Settings > Network > SMB Network Settings**:
 | `smb_client_realm` | | Kerberos realm, the Active Directory domain in capitals (`EXAMPLE.COM`). Empty for password authentication. |
 | `smb_client_kdc` | | Kerberos key distribution center host. Empty when the SMB server is the domain controller. |
 | `smb_client_num_contexts` | `4` | Connections kept open to the server, 1 to 20. |
-| `smb_client_timeout` | `5` | Seconds to wait for the server, 1 to 20. |
-| `smb_client_readahead` | `1024` | Read-ahead in KiB, 64 to 16384 (see below). |
+| `smb_client_timeout` | `5` | Seconds to wait for the server, 1 to 60. |
+| `smb_client_readahead` | `0` | Read-ahead in KiB, 0 (off) to 16384 (see below). |
 
 For Kerberos, give the server by host name, not by IP address: the ticket
 is issued for that name.
@@ -65,12 +69,22 @@ other cores have the file copied to local storage first. Changes to these
 settings apply the next time a share is browsed; content already running
 keeps its connection. A wired connection is more reliable than Wi-Fi.
 
+Besides the desktop and mobile builds, the 3DS, Vita and Switch carry the
+SMB client, on their hardware random number generators. The Wii U does
+not: it has no kernel source of randomness for the keys SMB derives.
+
 ## Loading content from NFS exports
 
 The NFS client supports NFSv3, which finds the NFS and MOUNT services
-through the server's portmapper, and NFSv4.0, which connects straight to
+through the server's portmapper, and NFSv4, which connects straight to
 the NFS port and addresses the export as a path in the server's
-pseudo-filesystem. It authenticates with AUTH_UNIX, as the user
+pseudo-filesystem. With version 4 chosen, the client speaks the newest
+of 4.2, 4.1 and 4.0 the server offers, so servers that have dropped 4.0
+work too. Over 4.2 it reads with READ_PLUS, which sends the holes of a
+sparse file as their extent instead of as zeros: an image the
+filesystem stores sparse costs its data on the network, not its size.
+A server whose READ_PLUS answers are impossible (nfs-ganesha 4.3's) is
+read with plain READ instead. It authenticates with AUTH_UNIX, as the user
 RetroArch runs as; platforms without user IDs, such as Windows and the
 consoles, send user and group 1000.
 
@@ -79,29 +93,33 @@ consoles, send user and group 1000.
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `nfs_server` | | Server IP address or host name. |
-| `nfs_export` | | Exported path, for example `/export/roms`. Empty to give the export in the address instead. |
+| `nfs_export` | | Exported path, for example `/export/roms`. For NFSv4 the same path works: when the server roots its v4 namespace lower down (Linux `fsid=0`), the leading part is dropped until the directory is found. Empty to give the export in the address instead. |
 | `nfs_subdir` | | Directory under the export. Optional. |
-| `nfs_version` | `3` | 3 or 4. |
+| `nfs_version` | `3` | 3, or 4 for the newest of 4.2, 4.1 and 4.0 the server offers. |
 | `nfs_port` | `0` | NFS service port; 0 asks the portmapper. |
 | `nfs_mount_port` | `0` | MOUNT service port (NFSv3); 0 asks the portmapper. |
 | `nfs_num_contexts` | `4` | Connections kept open, 1 to 16. |
 | `nfs_timeout` | `5` | Seconds to wait for the server, 1 to 60. |
-| `nfs_readahead` | `1024` | Read-ahead in KiB, 64 to 16384 (see below). |
+| `nfs_readahead` | `0` | Read-ahead in KiB, 0 (off) to 16384 (see below). |
 
-Content is addressed as `nfs://server/export/path/to/game.chd`.
+Content is addressed as `nfs://server/export/path/to/game.chd`. Besides
+the desktop and mobile builds, the 3DS, Vita, Switch and Wii U carry the
+NFS client; it needs no crypto library.
 
 ## Read-ahead
 
-Many cores read a disc image in small pieces. Over a network each piece
-would cost a round trip, which shows up as stutter. The SMB and NFS
-clients fetch a window around each read instead, with several requests
-in flight at once, and on a build with threads a background prefetcher
-keeps the next window coming for files opened read-only.
+Read-ahead is off by default: each read a core makes is one request to
+the server, which suits most content.
 
-`smb_client_readahead` and `nfs_readahead` set the window in KiB. A
-larger window is smoother over a slow or high-latency link and costs that
-much memory per open file. The default of 1024 KiB suits a local network;
-large disc images over Wi-Fi or a slow NAS may want 2048 or more.
+Some cores read a disc image in many small pieces, and over a slow or
+high-latency link each piece costs a round trip, which shows as
+stutter. With `smb_client_readahead` or `nfs_readahead` set, the client
+fetches a window of that many KiB around each read, with several
+requests in flight, and on a build with threads a background thread
+keeps the next window coming for files opened read-only. Each open file
+then holds that much memory, a second connection and a thread, so it is
+a poor fit for content that opens many small files at once. Try 1024
+for a large disc image that stutters; raise it for a slow link.
 
 ## Saved passwords: the keychain
 
@@ -168,3 +186,9 @@ The stack is on by default. `./configure` switches:
 The library options need the library installed and fail at configure time
 if it is not found. The consoles with 24 or 32 MiB of RAM (GameCube, Wii,
 PS2) build without the crypto library.
+
+The Visual Studio projects build the whole stack, from Visual Studio 2005
+up; Visual Studio 6 and .NET 2003 build without it. The CA bundle
+(`libretro-common/net/cacert.h`) is kept in parts under 64 KiB, the
+longest string literal MSVC before 2019 accepts; `tools/cacert_split.py`
+regenerates it from a new `cacert.pem`.

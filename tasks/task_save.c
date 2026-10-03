@@ -1006,9 +1006,16 @@ static bool task_push_undo_save_state(const char *path, void *data, size_t len)
          task->flags       &= ~RETRO_TASK_FLG_MUTE;
 
       if (task_queue_push(task))
+      {
          save_state_task_pending = true;
+         return true;
+      }
 
-      return true;
+      /* Another blocking task is already active: this one never runs,
+       * so nothing else frees what it holds */
+      task_free_title(task);
+      free(task);
+      task = NULL;
    }
 
    if (data)
@@ -2090,6 +2097,8 @@ bool content_save_state_in_progress(void* data)
    return save_state_task_pending;
 }
 
+/* Blocks until the state task is through.  For the exit, startup and
+ * init-failure paths only; CI keeps it out of menu/ and tasks/. */
 void content_wait_for_save_state_task(void)
 {
    task_queue_wait(content_save_state_in_progress, NULL);
@@ -2121,6 +2130,7 @@ bool content_load_state_in_progress(void* data)
    return load_state_task_pending;
 }
 
+/* As content_wait_for_save_state_task(), for a load. */
 void content_wait_for_load_state_task(void)
 {
    task_queue_wait(content_load_state_in_progress, NULL);
@@ -2192,7 +2202,19 @@ bool content_load_state(const char *path,
    else
       task->flags               &= ~RETRO_TASK_FLG_MUTE;
 
-   task_queue_push(task);
+   if (!task_queue_push(task))
+   {
+      /* Another blocking task is already active. No callback will run
+       * for this task, so the load is not pending - left set, the
+       * flag would hold a content close and a movie recording waiting
+       * on a load that never comes - and nothing else frees what it
+       * holds. */
+      load_state_task_pending   = false;
+      task_free_title(task);
+      free(task);
+      free(state);
+      return false;
+   }
 
    return true;
 

@@ -369,6 +369,7 @@ DEFAULT_SUBLABEL_MACRO(action_bind_sublabel_input_meta_netplay_fade_chat_toggle,
 DEFAULT_SUBLABEL_MACRO(action_bind_sublabel_input_device_type,                MENU_ENUM_SUBLABEL_INPUT_DEVICE_TYPE)
 DEFAULT_SUBLABEL_MACRO(action_bind_sublabel_input_device_index,               MENU_ENUM_SUBLABEL_INPUT_DEVICE_INDEX)
 DEFAULT_SUBLABEL_MACRO(action_bind_sublabel_input_mouse_index,                MENU_ENUM_SUBLABEL_INPUT_MOUSE_INDEX)
+DEFAULT_SUBLABEL_MACRO(action_bind_sublabel_input_keyboard_index,             MENU_ENUM_SUBLABEL_INPUT_KEYBOARD_INDEX)
 DEFAULT_SUBLABEL_MACRO(action_bind_sublabel_input_adc_type,                   MENU_ENUM_SUBLABEL_INPUT_ADC_TYPE)
 DEFAULT_SUBLABEL_MACRO(action_bind_sublabel_input_device_reservation_type,    MENU_ENUM_SUBLABEL_INPUT_DEVICE_RESERVATION_TYPE)
 DEFAULT_SUBLABEL_MACRO(action_bind_sublabel_input_device_reserved_device_name, MENU_ENUM_SUBLABEL_INPUT_DEVICE_RESERVED_DEVICE_NAME)
@@ -404,6 +405,10 @@ DEFAULT_SUBLABEL_MACRO(action_bind_sublabel_input_touch_vmouse_touchpad,   MENU_
 DEFAULT_SUBLABEL_MACRO(action_bind_sublabel_input_touch_vmouse_trackball,  MENU_ENUM_SUBLABEL_INPUT_TOUCH_VMOUSE_TRACKBALL)
 DEFAULT_SUBLABEL_MACRO(action_bind_sublabel_input_touch_vmouse_gesture,    MENU_ENUM_SUBLABEL_INPUT_TOUCH_VMOUSE_GESTURE)
 #endif
+DEFAULT_SUBLABEL_MACRO(action_bind_sublabel_input_stylus_enable,                     MENU_ENUM_SUBLABEL_INPUT_STYLUS_ENABLE)
+DEFAULT_SUBLABEL_MACRO(action_bind_sublabel_input_stylus_require_contact_for_click,  MENU_ENUM_SUBLABEL_INPUT_STYLUS_REQUIRE_CONTACT_FOR_CLICK)
+DEFAULT_SUBLABEL_MACRO(action_bind_sublabel_input_stylus_hover_moves_pointer,        MENU_ENUM_SUBLABEL_INPUT_STYLUS_HOVER_MOVES_POINTER)
+DEFAULT_SUBLABEL_MACRO(action_bind_sublabel_input_stylus_pressure_sensitivity,       MENU_ENUM_SUBLABEL_INPUT_STYLUS_PRESSURE_SENSITIVITY)
 
 
 #ifndef HAVE_DYNAMIC
@@ -691,42 +696,72 @@ DEFAULT_SUBLABEL_MACRO(action_bind_sublabel_nfs_client_settings,                
 DEFAULT_SUBLABEL_MACRO(action_bind_sublabel_nfs_client_browse,                           MENU_ENUM_SUBLABEL_NFS_CLIENT_BROWSE)
 #endif
 
+/* The row's port is in its entry_idx. */
 static int action_bind_sublabel_systeminfo_controller_entry(
       file_list_t *list,
       unsigned type, unsigned i,
       const char *label, const char *path,
       char *s, size_t len)
 {
-   char tmp[NAME_MAX_LENGTH];
-   unsigned controller;
-   const char *val_port_dev_name =
-      msg_hash_to_str(MENU_ENUM_LABEL_VALUE_PORT_DEVICE_NAME);
-
-   for (controller = 0; controller < MAX_USERS; controller++)
-   {
-      if (input_config_get_device_autoconfigured(controller))
-      {
-            snprintf(tmp, sizeof(tmp),
-               val_port_dev_name,
-               controller + 1,
-               input_config_get_device_name(controller));
-
-            if (string_is_equal(path, tmp))
-               break;
-      }
-   }
-
+   const char *display_name, *config_name;
+   unsigned port;
+   if (!list || i >= list->size || list->list[i].entry_idx >= MAX_USERS)
+      return 0;
+   port         = (unsigned)list->list[i].entry_idx;
+   display_name = input_config_get_device_display_name(port);
+   config_name  = input_config_get_device_config_name(port);
    snprintf(s, len,
          msg_hash_to_str(MENU_ENUM_LABEL_VALUE_PORT_DEVICE_INFO),
-           input_config_get_device_display_name(controller)
-         ? input_config_get_device_display_name(controller)
+         display_name ? display_name
          : msg_hash_to_str(MENU_ENUM_LABEL_VALUE_NOT_AVAILABLE),
-           input_config_get_device_display_name(controller)
-         ? input_config_get_device_config_name(controller)
+         config_name  ? config_name
          : msg_hash_to_str(MENU_ENUM_LABEL_VALUE_NOT_AVAILABLE),
-           input_config_get_device_vid(controller),
-           input_config_get_device_pid(controller));
+         input_config_get_device_vid(port),
+         input_config_get_device_pid(port));
+   return 0;
+}
 
+/* A keyboard's entry in Input Information: its own ids, where the
+ * input driver knows them, and nothing where it does not. (It used to
+ * be given the controller entry's label, and showed the names and ids
+ * of the controller on the first port.) */
+static int action_bind_sublabel_systeminfo_keyboard_entry(
+      file_list_t *list,
+      unsigned type, unsigned i,
+      const char *label, const char *path,
+      char *s, size_t len)
+{
+   unsigned idx;
+   if (!list || i >= list->size)
+      return 0;
+   idx = (unsigned)list->list[i].entry_idx;
+   if (     input_config_get_keyboard_vid(idx)
+         || input_config_get_keyboard_pid(idx))
+      snprintf(s, len,
+            msg_hash_to_str(MENU_ENUM_LABEL_VALUE_KEYBOARD_DEVICE_INFO),
+            input_config_get_keyboard_vid(idx),
+            input_config_get_keyboard_pid(idx));
+   return 0;
+}
+
+/* A mouse's entry in Input Information: its own ids, where the input
+ * driver knows them. */
+static int action_bind_sublabel_systeminfo_mouse_entry(
+      file_list_t *list,
+      unsigned type, unsigned i,
+      const char *label, const char *path,
+      char *s, size_t len)
+{
+   unsigned idx;
+   if (!list || i >= list->size)
+      return 0;
+   idx = (unsigned)list->list[i].entry_idx;
+   if (     input_config_get_mouse_vid(idx)
+         || input_config_get_mouse_pid(idx))
+      snprintf(s, len,
+            msg_hash_to_str(MENU_ENUM_LABEL_VALUE_KEYBOARD_DEVICE_INFO),
+            input_config_get_mouse_vid(idx),
+            input_config_get_mouse_pid(idx));
    return 0;
 }
 
@@ -1204,6 +1239,7 @@ static int action_bind_sublabel_playlist_entry(
       char *s, size_t len)
 {
    size_t _len;
+   size_t core_name_len;
    struct menu_state    *menu_st             = menu_state_get_ptr();
    menu_list_t *menu_list                    = menu_st->entries.list;
    size_t list_size                          = MENU_LIST_GET_SELECTION(menu_list, 0)->size;
@@ -1254,11 +1290,23 @@ static int action_bind_sublabel_playlist_entry(
       return 0;
 
    /* Add core name */
-   _len      = strlcpy(s,
+   if (!len)
+      return 0;
+
+   _len = strlcpy(s,
          msg_hash_to_str(MENU_ENUM_LABEL_VALUE_PLAYLIST_SUBLABEL_CORE), len);
-   s[  _len] =  ' ';
-   s[++_len] =  '\0';
-   _len     += strlcpy(s + _len, entry->core_name, len - _len);
+   if (_len >= len - 1)
+      return 0;
+
+   s[_len++] = ' ';
+   s[_len]   = '\0';
+
+   /* strlcpy returns the source length even when the copy is truncated.
+    * Keep the offset within s before appending runtime information. */
+   core_name_len = strlcpy(s + _len, entry->core_name, len - _len);
+   if (core_name_len >= len - _len)
+      return 0;
+   _len += core_name_len;
 
    /* Get runtime info *if* required runtime log is enabled
     * *and* this is a valid playlist type */
@@ -1828,7 +1876,7 @@ int menu_cbs_init_bind_sublabel(menu_file_list_cbs_t *cbs,
 #if defined(HAVE_NETWORKING) && defined(HAVE_SSL)
       { MENU_ENUM_LABEL_TLS_VERIFY_MODE, MENU_ENUM_SUBLABEL_TLS_VERIFY_MODE },
 #endif
-#if defined(HAVE_NETWORKING) && defined(HAVE_NETWORK_CMD)
+#ifdef HAVE_MCP
       { MENU_ENUM_LABEL_MCP_SERVER_ENABLE, MENU_ENUM_SUBLABEL_MCP_SERVER_ENABLE },
       { MENU_ENUM_LABEL_MCP_SERVER_PORT, MENU_ENUM_SUBLABEL_MCP_SERVER_PORT },
       { MENU_ENUM_LABEL_MCP_SERVER_TOKEN, MENU_ENUM_SUBLABEL_MCP_SERVER_TOKEN },
@@ -1988,7 +2036,6 @@ int menu_cbs_init_bind_sublabel(menu_file_list_cbs_t *cbs,
       { MENU_ENUM_LABEL_MENU_SHOW_DUMP_DISC, MENU_ENUM_SUBLABEL_MENU_SHOW_DUMP_DISC },
       { MENU_ENUM_LABEL_MENU_SHOW_INFORMATION, MENU_ENUM_SUBLABEL_MENU_SHOW_INFORMATION },
       { MENU_ENUM_LABEL_MENU_SHOW_CONFIGURATIONS, MENU_ENUM_SUBLABEL_MENU_SHOW_CONFIGURATIONS },
-      { MENU_ENUM_LABEL_MENU_SHOW_HELP, MENU_ENUM_SUBLABEL_MENU_SHOW_HELP },
       { MENU_ENUM_LABEL_MENU_SHOW_QUIT_RETROARCH, MENU_ENUM_SUBLABEL_MENU_SHOW_QUIT_RETROARCH },
       { MENU_ENUM_LABEL_MENU_SHOW_REBOOT, MENU_ENUM_SUBLABEL_MENU_SHOW_REBOOT },
       { MENU_ENUM_LABEL_MENU_SHOW_SHUTDOWN, MENU_ENUM_SUBLABEL_MENU_SHOW_SHUTDOWN },
@@ -2107,6 +2154,7 @@ int menu_cbs_init_bind_sublabel(menu_file_list_cbs_t *cbs,
       { MENU_ENUM_LABEL_CORE_UPDATER_AUTO_EXTRACT_ARCHIVE, MENU_ENUM_SUBLABEL_CORE_UPDATER_AUTO_EXTRACT_ARCHIVE },
       { MENU_ENUM_LABEL_CORE_UPDATER_SHOW_EXPERIMENTAL_CORES, MENU_ENUM_SUBLABEL_CORE_UPDATER_SHOW_EXPERIMENTAL_CORES },
       { MENU_ENUM_LABEL_CORE_UPDATER_AUTO_BACKUP, MENU_ENUM_SUBLABEL_CORE_UPDATER_AUTO_BACKUP },
+      { MENU_ENUM_LABEL_CORE_UPDATER_AUTO_BACKUP_COMPRESS, MENU_ENUM_SUBLABEL_CORE_UPDATER_AUTO_BACKUP_COMPRESS },
       { MENU_ENUM_LABEL_CORE_UPDATER_AUTO_BACKUP_HISTORY_SIZE, MENU_ENUM_SUBLABEL_CORE_UPDATER_AUTO_BACKUP_HISTORY_SIZE },
       { MENU_ENUM_LABEL_CORE_UPDATER_BUILDBOT_URL, MENU_ENUM_SUBLABEL_CORE_UPDATER_BUILDBOT_URL },
       { MENU_ENUM_LABEL_BUILDBOT_ASSETS_URL, MENU_ENUM_SUBLABEL_BUILDBOT_ASSETS_URL },
@@ -2265,7 +2313,7 @@ int menu_cbs_init_bind_sublabel(menu_file_list_cbs_t *cbs,
       { MENU_ENUM_LABEL_FASTFORWARD_RATIO, MENU_ENUM_SUBLABEL_FASTFORWARD_RATIO },
       { MENU_ENUM_LABEL_FASTFORWARD_FRAMESKIP, MENU_ENUM_SUBLABEL_FASTFORWARD_FRAMESKIP },
       { MENU_ENUM_LABEL_VRR_RUNLOOP_ENABLE, MENU_ENUM_SUBLABEL_VRR_RUNLOOP_ENABLE },
-      { MENU_ENUM_LABEL_MENU_THROTTLE_FRAMERATE, MENU_ENUM_SUBLABEL_MENU_ENUM_THROTTLE_FRAMERATE },
+      { MENU_ENUM_LABEL_MENU_FRAME_RATE, MENU_ENUM_SUBLABEL_MENU_FRAME_RATE },
       { MENU_ENUM_LABEL_BLOCK_SRAM_OVERWRITE, MENU_ENUM_SUBLABEL_BLOCK_SRAM_OVERWRITE },
       { MENU_ENUM_LABEL_SAVESTATE_AUTO_INDEX, MENU_ENUM_SUBLABEL_SAVESTATE_AUTO_INDEX },
       { MENU_ENUM_LABEL_REPLAY_AUTO_INDEX, MENU_ENUM_SUBLABEL_REPLAY_AUTO_INDEX },
@@ -2331,6 +2379,7 @@ int menu_cbs_init_bind_sublabel(menu_file_list_cbs_t *cbs,
       { MENU_ENUM_LABEL_SYSTEM_INFORMATION, MENU_ENUM_SUBLABEL_SYSTEM_INFORMATION },
       { MENU_ENUM_LABEL_DISPLAY_INFORMATION, MENU_ENUM_SUBLABEL_DISPLAY_INFORMATION },
       { MENU_ENUM_LABEL_DISPLAY_EDID_INFORMATION, MENU_ENUM_SUBLABEL_DISPLAY_EDID_INFORMATION },
+      { MENU_ENUM_LABEL_INPUT_INFORMATION, MENU_ENUM_SUBLABEL_INPUT_INFORMATION },
       { MENU_ENUM_LABEL_LOAD_CONTENT_LIST, MENU_ENUM_SUBLABEL_LOAD_CONTENT_LIST },
       { MENU_ENUM_LABEL_SUBSYSTEM_SETTINGS, MENU_ENUM_SUBLABEL_SUBSYSTEM_SETTINGS },
       { MENU_ENUM_LABEL_LOAD_CONTENT_SPECIAL, MENU_ENUM_SUBLABEL_LOAD_CONTENT_SPECIAL },
@@ -2576,7 +2625,6 @@ int menu_cbs_init_bind_sublabel(menu_file_list_cbs_t *cbs,
       { MENU_ENUM_LABEL_INPUT_HAPTIC_FEEDBACK_SETTINGS, MENU_ENUM_SUBLABEL_INPUT_HAPTIC_FEEDBACK_SETTINGS },
       { MENU_ENUM_LABEL_INPUT_SENSOR_SETTINGS, MENU_ENUM_SUBLABEL_INPUT_SENSOR_SETTINGS },
       { MENU_ENUM_LABEL_WIFI_SETTINGS, MENU_ENUM_SUBLABEL_WIFI_SETTINGS },
-      { MENU_ENUM_LABEL_HELP_LIST, MENU_ENUM_SUBLABEL_HELP_LIST },
       { MENU_ENUM_LABEL_USER_LANGUAGE, MENU_ENUM_SUBLABEL_USER_LANGUAGE },
       { MENU_ENUM_LABEL_SUSPEND_SCREENSAVER_ENABLE, MENU_ENUM_SUBLABEL_SUSPEND_SCREENSAVER_ENABLE },
       { MENU_ENUM_LABEL_VIDEO_SCALE, MENU_ENUM_SUBLABEL_VIDEO_WINDOW_SCALE },
@@ -2686,6 +2734,8 @@ int menu_cbs_init_bind_sublabel(menu_file_list_cbs_t *cbs,
       { MENU_ENUM_LABEL_VIDEO_CTX_SCALING, action_bind_sublabel_video_ctx_scaling },
       { MENU_ENUM_LABEL_CORE_INFO_ENTRY, action_bind_sublabel_core_info_entry },
       { MENU_ENUM_LABEL_SYSTEM_INFO_CONTROLLER_ENTRY, action_bind_sublabel_systeminfo_controller_entry },
+      { MENU_ENUM_LABEL_SYSTEM_INFO_KEYBOARD_ENTRY, action_bind_sublabel_systeminfo_keyboard_entry },
+      { MENU_ENUM_LABEL_SYSTEM_INFO_MOUSE_ENTRY, action_bind_sublabel_systeminfo_mouse_entry },
       { MENU_ENUM_LABEL_PLAYLIST_ENTRY, action_bind_sublabel_playlist_entry },
       { MENU_ENUM_LABEL_CORE_RESTORE_BACKUP_ENTRY, action_bind_sublabel_core_backup_entry },
       { MENU_ENUM_LABEL_CORE_DELETE_BACKUP_ENTRY, action_bind_sublabel_core_backup_entry },
@@ -3372,6 +3422,18 @@ int menu_cbs_init_bind_sublabel(menu_file_list_cbs_t *cbs,
             BIND_ACTION_SUBLABEL(cbs, action_bind_sublabel_input_touch_vmouse_gesture);
             break;
 #endif
+         case MENU_ENUM_LABEL_INPUT_STYLUS_ENABLE:
+            BIND_ACTION_SUBLABEL(cbs, action_bind_sublabel_input_stylus_enable);
+            break;
+         case MENU_ENUM_LABEL_INPUT_STYLUS_REQUIRE_CONTACT_FOR_CLICK:
+            BIND_ACTION_SUBLABEL(cbs, action_bind_sublabel_input_stylus_require_contact_for_click);
+            break;
+         case MENU_ENUM_LABEL_INPUT_STYLUS_HOVER_MOVES_POINTER:
+            BIND_ACTION_SUBLABEL(cbs, action_bind_sublabel_input_stylus_hover_moves_pointer);
+            break;
+         case MENU_ENUM_LABEL_INPUT_STYLUS_PRESSURE_SENSITIVITY:
+            BIND_ACTION_SUBLABEL(cbs, action_bind_sublabel_input_stylus_pressure_sensitivity);
+            break;
          case MENU_ENUM_LABEL_AUDIO_MIXER_VOLUME:
 #ifdef HAVE_AUDIOMIXER
             BIND_ACTION_SUBLABEL(cbs, action_bind_sublabel_audio_mixer_volume);
@@ -3804,6 +3866,10 @@ int menu_cbs_init_bind_sublabel(menu_file_list_cbs_t *cbs,
          {
             MENU_ENUM_LABEL_INPUT_MOUSE_INDEX,
             action_bind_sublabel_input_mouse_index
+         },
+         {
+            MENU_ENUM_LABEL_INPUT_KEYBOARD_INDEX,
+            action_bind_sublabel_input_keyboard_index
          },
          {
             MENU_ENUM_LABEL_INPUT_JOYPAD_INDEX,

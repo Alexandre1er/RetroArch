@@ -14,11 +14,15 @@
 
 #include <compat/strl.h>
 #include <encodings/base64.h>
+#include <features/features_cpu.h>
 #include <lists/string_list.h>
 #include <lrc_hash.h>
 #include <net/net_http.h>
 #include <time/rtime.h>
 #include <string/stdstring.h>
+#ifdef HAVE_CRYPTO
+#include <crypto/kdf.h>
+#endif
 
 #include "../cloud_sync_driver.h"
 #include "../../retroarch.h"
@@ -67,8 +71,8 @@ typedef struct
    char *nonce;
    char *algo;
    char *opaque;
-   const char *cnonce;
    unsigned nc;
+   char cnonce[33];
    bool qop_auth;
    bool dav_verified;
 } webdav_state_t;
@@ -162,6 +166,34 @@ static void webdav_cleanup_digest(void)
    webdav_st->nc = 1;
 }
 
+/* A new client nonce for each challenge, as 32 hex digits. The cnonce
+ * is the client's own input to the digest: with a fixed one, a hostile
+ * server (or anyone in the middle of plain HTTP) picks every other input
+ * and can test password guesses against tables computed in advance.
+ * From the platform entropy source where the crypto library has one,
+ * otherwise from the microsecond clock and a counter, which still
+ * differs per challenge but is not unpredictable. */
+static void webdav_create_cnonce(char *out)
+{
+   static unsigned counter = 0;
+   unsigned char   bytes[16];
+   size_t          i;
+#ifdef HAVE_CRYPTO
+   if (crypto_random_bytes(bytes, sizeof(bytes)) != 0)
+#endif
+   {
+      MD5_CTX  md5;
+      retro_time_t now = cpu_features_get_time_usec();
+      counter++;
+      MD5_Init(&md5);
+      MD5_Update(&md5, &now, sizeof(now));
+      MD5_Update(&md5, &counter, sizeof(counter));
+      MD5_Final(bytes, &md5);
+   }
+   for (i = 0; i < sizeof(bytes); i++)
+      snprintf(out + i * 2, 3, "%02x", bytes[i]);
+}
+
 static char *webdav_create_ha1_hash(char *user, char *realm, char *pass)
 {
    MD5_CTX md5;
@@ -187,13 +219,38 @@ static char *webdav_create_ha1_hash(char *user, char *realm, char *pass)
    return hash;
 }
 
-static bool webdav_create_digest_auth(char *digest)
+/* The quoted value starting at @p (just past its opening quote), as a
+ * new string replacing *@out.  Returns the position after the closing
+ * quote, or NULL when there is no closing quote or no memory. */
+static const char *webdav_digest_quoted(const char *p, char **out)
 {
-   size_t _len;
+   const char *q = strchr(p, '"');
+   size_t      n;
+   char       *v;
+
+   if (!q)
+      return NULL;
+   n = (size_t)(q - p);
+   if (!(v = (char*)malloc(n + 1)))
+      return NULL;
+   memcpy(v, p, n);
+   v[n] = '\0';
+   free(*out);
+   *out = v;
+   return q + 1;
+}
+
+/* Parse a "WWW-Authenticate: Digest ..." challenge into webdav_st.  The
+ * challenge comes from the server, so every scan is bounded by the end
+ * of the line: a value with no closing quote used to reach strchr() ==
+ * NULL and crash on the length computed from it, and an unknown
+ * unquoted parameter at the end of the line was skipped by a loop that
+ * never looked for the terminator and read on past it. */
+static bool webdav_create_digest_auth(const char *digest)
+{
    webdav_state_t *webdav_st = webdav_state_get_ptr();
    settings_t     *settings  = config_get_ptr();
-   char           *ptr       = digest + (sizeof("WWW-Authenticate: Digest")-1);
-   char           *end       = ptr + strlen(ptr);
+   const char     *ptr       = digest + (sizeof("WWW-Authenticate: Digest")-1);
 
    if (   !*settings->arrays.webdav_username
        && !*settings->arrays.webdav_password)
@@ -203,9 +260,9 @@ static bool webdav_create_digest_auth(char *digest)
 
    webdav_st->username = settings->arrays.webdav_username;
 
-   while (ptr < end)
+   for (;;)
    {
-      while (*ptr == ' ' || *ptr == '\t' || *ptr == '\r' || *ptr == '\n')
+      while (*ptr == ' ' || *ptr == '\t' || *ptr == '\r' || *ptr == '\n' || *ptr == ',')
          ++ptr;
 
       if (!*ptr)
@@ -213,101 +270,94 @@ static bool webdav_create_digest_auth(char *digest)
 
       if (string_starts_with(ptr, "realm=\""))
       {
-         ptr += (sizeof("realm=\"")-1);
-         _len = strchr(ptr, '"') + 1 - ptr;
-         webdav_st->realm = (char*)malloc(_len);
-         strlcpy(webdav_st->realm, ptr, _len);
-         ptr += _len;
-
+         if (!(ptr = webdav_digest_quoted(ptr + STRLEN_CONST("realm=\""),
+                     &webdav_st->realm)))
+            return false;
+         free(webdav_st->ha1hash);
          webdav_st->ha1hash = webdav_create_ha1_hash(
                webdav_st->username, webdav_st->realm,
                settings->arrays.webdav_password);
       }
       else if (string_starts_with(ptr, "qop=\""))
       {
-         char *tail;
-         ptr += (sizeof("qop=\"")-1);
-         tail = strchr(ptr, '"');
+         const char *tail;
+         ptr += STRLEN_CONST("qop=\"");
+         if (!(tail = strchr(ptr, '"')))
+            return false;
+         /* Any member of the list equal to "auth". */
          while (ptr < tail)
          {
-            if (    string_starts_with(ptr, "auth")
-                && (ptr[4] == ',' || ptr[4] == '"'))
-            {
-               webdav_st->qop_auth = true;
-               break;
-            }
-            while (*ptr != ',' && *ptr != '"' && *ptr != '\0')
+            const char *e = ptr;
+            while (e < tail && *e != ',')
+               e++;
+            while (ptr < e && (*ptr == ' ' || *ptr == '\t'))
                ptr++;
-            ptr++;
+            if (e - ptr == 4 && !strncmp(ptr, "auth", 4))
+               webdav_st->qop_auth = true;
+            ptr = (e < tail) ? e + 1 : e;
          }
          /* not even going to try for auth-int, sorry */
          if (!webdav_st->qop_auth)
             return false;
-         while (*ptr != ',' && *ptr != '"' && *ptr != '\0')
-            ptr++;
-         ptr++;
+         ptr = tail + 1;
       }
       else if (string_starts_with(ptr, "nonce=\""))
       {
-         ptr += (sizeof("nonce=\"")-1);
-         _len = strchr(ptr, '"') + 1 - ptr;
-         webdav_st->nonce = (char*)malloc(_len);
-         strlcpy(webdav_st->nonce, ptr, _len);
-         ptr += _len;
-      }
-      else if (string_starts_with(ptr, "algorithm="))
-      {
-         ptr += (sizeof("algorithm=")-1);
-         if (strchr(ptr, ','))
-         {
-            _len = strchr(ptr, ',') + 1 - ptr;
-            webdav_st->algo = (char*)malloc(_len);
-            strlcpy(webdav_st->algo, ptr, _len);
-            ptr += _len;
-         }
-         else
-         {
-            webdav_st->algo = strdup(ptr);
-            ptr += strlen(ptr);
-         }
+         if (!(ptr = webdav_digest_quoted(ptr + STRLEN_CONST("nonce=\""),
+                     &webdav_st->nonce)))
+            return false;
       }
       else if (string_starts_with(ptr, "opaque=\""))
       {
-         ptr += (sizeof("opaque=\"")-1);
-         _len = strchr(ptr, '"') + 1 - ptr;
-         webdav_st->opaque = (char*)malloc(_len);
-         strlcpy(webdav_st->opaque, ptr, _len);
-         ptr += _len;
+         if (!(ptr = webdav_digest_quoted(ptr + STRLEN_CONST("opaque=\""),
+                     &webdav_st->opaque)))
+            return false;
+      }
+      else if (string_starts_with(ptr, "algorithm=\""))
+      {
+         if (!(ptr = webdav_digest_quoted(ptr + STRLEN_CONST("algorithm=\""),
+                     &webdav_st->algo)))
+            return false;
+      }
+      else if (string_starts_with(ptr, "algorithm="))
+      {
+         const char *e;
+         size_t      n;
+         ptr += STRLEN_CONST("algorithm=");
+         for (e = ptr; *e && *e != ','; e++) { }
+         n = (size_t)(e - ptr);
+         free(webdav_st->algo);
+         if (!(webdav_st->algo = (char*)malloc(n + 1)))
+            return false;
+         memcpy(webdav_st->algo, ptr, n);
+         webdav_st->algo[n] = '\0';
+         ptr = e;
       }
       else
       {
-         while (*ptr != '=' && *ptr != '\0')
+         /* Unknown parameter: name=value or name="value", skipped. */
+         while (*ptr && *ptr != '=' && *ptr != ',')
             ptr++;
-         ptr++;
-         if (*ptr == '"')
+         if (*ptr == '=')
          {
             ptr++;
-            while (*ptr != '"' && *ptr != '\0')
+            if (*ptr == '"')
+            {
+               if (!(ptr = strchr(ptr + 1, '"')))
+                  return false;
                ptr++;
-            ptr++;
-         }
-         else
-         {
-            while (*ptr != ',' && *ptr != ',')
-               ptr++;
+            }
+            else
+               while (*ptr && *ptr != ',')
+                  ptr++;
          }
       }
-
-      while (*ptr == ' ' || *ptr == '\t' || *ptr == '\r' || *ptr == '\n')
-         ++ptr;
-      if (*ptr == ',')
-         ptr++;
    }
 
    if (!webdav_st->ha1hash || !webdav_st->nonce)
       return false;
 
-   webdav_st->cnonce = "1a2b3c4f";
+   webdav_create_cnonce(webdav_st->cnonce);
    webdav_st->basic = false;
 
    return true;
@@ -513,7 +563,7 @@ static char *webdav_get_auth_header(const char *method, const char *url)
 static void webdav_log_http_failure(const char *path,
       http_transfer_data_t *data, const char *err)
 {
-    size_t i;
+    const char *h;
     size_t _len = 0;
     /* Cloud sync runs several transfers at once, so one RARCH_WARN per
      * header interleaves with the other tasks' output and produces logs
@@ -528,13 +578,13 @@ static void webdav_log_http_failure(const char *path,
      * which is the only clue a log on a console will carry. */
     if (data->status < 0 && err && *err && _len < sizeof(report) - 1)
        _len += snprintf(report + _len, sizeof(report) - _len, " (%s)", err);
-    for (i = 0; data->headers && i < data->headers->size; i++)
+    for (h = net_http_header_next(data->headers, NULL); h;
+          h = net_http_header_next(data->headers, h))
     {
        if (_len >= sizeof(report) - 1)
           break;
        report[_len++] = '\n';
-       _len += strlcpy(report + _len, data->headers->elems[i].data,
-             sizeof(report) - _len);
+       _len += strlcpy(report + _len, h, sizeof(report) - _len);
     }
     RARCH_WARN("%s\n", report);
     /* The buffer returned by net_http_data() is sized exactly to
@@ -552,24 +602,25 @@ static void webdav_log_http_failure(const char *path,
 
 static bool webdav_needs_reauth(http_transfer_data_t *data)
 {
-   size_t i;
+   const char *h;
 
    if (!data || data->status != 401 || !data->headers)
       return false;
 
-   for (i = 0; i < data->headers->size; i++)
+   for (h = net_http_header_next(data->headers, NULL); h;
+         h = net_http_header_next(data->headers, h))
    {
       /* Header names are case-insensitive (RFC 9110 5.1), and the
        * emscripten backend gets them from the browser, which
        * lower-cases them.  The offset skipped by
        * webdav_create_digest_auth() below is a fixed length, so
        * matching case-insensitively here stays correct. */
-      if (!string_starts_with_case_insensitive(data->headers->elems[i].data,
+      if (!string_starts_with_case_insensitive(h,
                "WWW-Authenticate: Digest "))
          continue;
 
       RARCH_DBG("[webdav] Found WWW-Authenticate: Digest header\n");
-      if (webdav_create_digest_auth(data->headers->elems[i].data))
+      if (webdav_create_digest_auth(h))
          return true;
       RARCH_WARN("[webdav] Failure creating WWW-Authenticate: Digest header\n");
    }
@@ -634,11 +685,11 @@ static bool webdav_allow_lists_method(const char *allow, const char *method)
 static void webdav_check_options(http_transfer_data_t *data,
       bool *dav, bool *allow_seen, bool *allow_dav_method)
 {
-   size_t i;
+   const char *hdr;
 
-   for (i = 0; data->headers && i < data->headers->size; i++)
+   for (hdr = net_http_header_next(data->headers, NULL); hdr;
+         hdr = net_http_header_next(data->headers, hdr))
    {
-      const char *hdr = data->headers->elems[i].data;
 
       if (string_starts_with_case_insensitive(hdr, "DAV:"))
          *dav = true;

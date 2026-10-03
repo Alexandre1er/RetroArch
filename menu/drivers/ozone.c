@@ -297,7 +297,6 @@ enum
    OZONE_ENTRIES_ICONS_TEXTURE_EXIT,
    OZONE_ENTRIES_ICONS_TEXTURE_FRAMESKIP,
    OZONE_ENTRIES_ICONS_TEXTURE_INFO,
-   OZONE_ENTRIES_ICONS_TEXTURE_HELP,
    OZONE_ENTRIES_ICONS_TEXTURE_NETWORK,
    OZONE_ENTRIES_ICONS_TEXTURE_POWER,
    OZONE_ENTRIES_ICONS_TEXTURE_SAVING,
@@ -2211,8 +2210,6 @@ static uintptr_t ozone_entries_icon_get_texture(
             return icons_tex[OZONE_ENTRIES_ICONS_TEXTURE_CORE];
       case MENU_ENUM_LABEL_CURSOR_MANAGER_LIST:
             return icons_tex[OZONE_ENTRIES_ICONS_TEXTURE_CURSOR];
-      case MENU_ENUM_LABEL_HELP_LIST:
-            return icons_tex[OZONE_ENTRIES_ICONS_TEXTURE_HELP];
       case MENU_ENUM_LABEL_QUIT_RETROARCH:
             return icons_tex[OZONE_ENTRIES_ICONS_TEXTURE_EXIT];
 
@@ -2246,6 +2243,7 @@ static uintptr_t ozone_entries_icon_get_texture(
       case MENU_ENUM_LABEL_PLAYLIST_MANAGER_RIGHT_THUMBNAIL_MODE:
          return icons_tex[OZONE_ENTRIES_ICONS_TEXTURE_SUBSETTING];
       case MENU_ENUM_LABEL_INPUT_SETTINGS:
+      case MENU_ENUM_LABEL_INPUT_INFORMATION:
       case MENU_ENUM_LABEL_DEFERRED_INPUT_SETTINGS_LIST:
       case MENU_ENUM_LABEL_SETTINGS_SHOW_INPUT:
       case MENU_ENUM_LABEL_QUICK_MENU_SHOW_CONTROLS:
@@ -2275,7 +2273,7 @@ static uintptr_t ozone_entries_icon_get_texture(
       case MENU_ENUM_LABEL_DEFERRED_LATENCY_SETTINGS_LIST:
       case MENU_ENUM_LABEL_CONTENT_SHOW_LATENCY:
       case MENU_ENUM_LABEL_SETTINGS_SHOW_LATENCY:
-      case MENU_ENUM_LABEL_MENU_THROTTLE_FRAMERATE:
+      case MENU_ENUM_LABEL_MENU_FRAME_RATE:
             return icons_tex[OZONE_ENTRIES_ICONS_TEXTURE_LATENCY];
       case MENU_ENUM_LABEL_SAVING_SETTINGS:
       case MENU_ENUM_LABEL_DEFERRED_SAVING_SETTINGS_LIST:
@@ -2698,6 +2696,8 @@ static uintptr_t ozone_entries_icon_get_texture(
             return icons_tex[OZONE_ENTRIES_ICONS_TEXTURE_INPUT_SETTINGS];
          else if (string_ends_with_size(enum_label, "_mouse_index", enum_label_len, STRLEN_CONST("_mouse_index")))
             return icons_tex[OZONE_ENTRIES_ICONS_TEXTURE_INPUT_MOUSE];
+         else if (string_ends_with_size(enum_label, "_keyboard_index", enum_label_len, STRLEN_CONST("_keyboard_index")))
+            return icons_tex[OZONE_ENTRIES_ICONS_TEXTURE_INPUT_SETTINGS];
          else if (string_ends_with_size(enum_label, "_analog_dpad_mode", enum_label_len, STRLEN_CONST("_analog_dpad_mode")))
             return icons_tex[OZONE_ENTRIES_ICONS_TEXTURE_INPUT_ADC];
          else if (string_ends_with_size(enum_label, "_bind_all", enum_label_len, STRLEN_CONST("_bind_all")))
@@ -2913,8 +2913,6 @@ static const char *ozone_entries_icon_texture_path(unsigned id)
          return "menu_exit.png";
       case OZONE_ENTRIES_ICONS_TEXTURE_FRAMESKIP:
          return "menu_frameskip.png";
-      case OZONE_ENTRIES_ICONS_TEXTURE_HELP:
-         return "menu_help.png";
       case OZONE_ENTRIES_ICONS_TEXTURE_INFO:
          return "menu_info.png";
       case OZONE_ENTRIES_ICONS_TEXTURE_INPUT_SETTINGS:
@@ -4736,6 +4734,9 @@ static void ozone_free_node(ozone_node_t *node)
    if (!node)
       return;
 
+   /* Sidebar icons still uploading into it land nowhere */
+   gfx_display_texture_loads_cancel(node, sizeof(*node));
+
    if (node->console_name)
       free(node->console_name);
 
@@ -5298,6 +5299,7 @@ static void ozone_context_destroy_horizontal_list(ozone_handle_t *ozone)
 
       if (string_ends_with_size(path, ".lpl", strlen(path), STRLEN_CONST(".lpl")))
       {
+         gfx_display_texture_loads_cancel(node, sizeof(*node));
          video_driver_texture_unload(&node->icon);
          video_driver_texture_unload(&node->content_icon);
       }
@@ -9988,6 +9990,8 @@ static void ozone_free(void *data)
 
    if (ozone)
    {
+      /* Theme textures still uploading land nowhere */
+      gfx_display_texture_loads_cancel(ozone, sizeof(*ozone));
       /* Invalidate any in-flight async icon loads before freeing
        * the nodes they would write into */
       ozone_icon_load_gen++;
@@ -10634,6 +10638,9 @@ static void ozone_context_destroy(void *data)
 
    if (!ozone)
       return;
+
+   /* Theme textures still uploading land nowhere */
+   gfx_display_texture_loads_cancel(ozone, sizeof(*ozone));
 
    /* Signal the render path to stop using textures/fonts.
     * Under threaded video, ozone_frame() may be mid-render on

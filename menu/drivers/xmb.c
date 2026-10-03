@@ -217,7 +217,6 @@ enum
    XMB_TEXTURE_EXIT,
    XMB_TEXTURE_FRAMESKIP,
    XMB_TEXTURE_INFO,
-   XMB_TEXTURE_HELP,
    XMB_TEXTURE_NETWORK,
    XMB_TEXTURE_POWER,
    XMB_TEXTURE_SAVING,
@@ -363,6 +362,8 @@ enum xmb_drag_mode
 
 typedef struct xmb_handle
 {
+   /* The ribbon's grid, drawn by the ribbon programs */
+   gfx_display_mesh_t *ribbon_mesh;
    /* Keeps track of the last time tabs were switched
     * via a MENU_ACTION_LEFT/MENU_ACTION_RIGHT event */
    retro_time_t last_tab_switch_time; /* uint64_t alignment */
@@ -3037,6 +3038,9 @@ static void xmb_set_title(xmb_handle_t *xmb)
          else if (enum_idx >= MENU_ENUM_LABEL_INPUT_MOUSE_INDEX
                && enum_idx <= MENU_ENUM_LABEL_INPUT_MOUSE_INDEX_LAST)
             enum_idx = MENU_ENUM_LABEL_INPUT_MOUSE_INDEX;
+         else if (enum_idx >= MENU_ENUM_LABEL_INPUT_KEYBOARD_INDEX
+               && enum_idx <= MENU_ENUM_LABEL_INPUT_KEYBOARD_INDEX_LAST)
+            enum_idx = MENU_ENUM_LABEL_INPUT_KEYBOARD_INDEX;
          else if (enum_idx >= MENU_ENUM_LABEL_INPUT_PLAYER_ANALOG_DPAD_MODE
                && enum_idx <= MENU_ENUM_LABEL_INPUT_PLAYER_ANALOG_DPAD_MODE_LAST)
             enum_idx = MENU_ENUM_LABEL_INPUT_PLAYER_ANALOG_DPAD_MODE;
@@ -4481,8 +4485,6 @@ static uintptr_t xmb_icon_get_id(xmb_handle_t *xmb,
          return xmb->textures.list[XMB_TEXTURE_RDB];
       case MENU_ENUM_LABEL_CURSOR_MANAGER_LIST:
          return xmb->textures.list[XMB_TEXTURE_CURSOR];
-      case MENU_ENUM_LABEL_HELP_LIST:
-         return xmb->textures.list[XMB_TEXTURE_HELP];
       case MENU_ENUM_LABEL_QUIT_RETROARCH:
          return xmb->textures.list[XMB_TEXTURE_EXIT];
 
@@ -4503,6 +4505,7 @@ static uintptr_t xmb_icon_get_id(xmb_handle_t *xmb,
       case MENU_ENUM_LABEL_SETTINGS_SHOW_FILE_BROWSER:
          return xmb->textures.list[XMB_TEXTURE_SETTING];
       case MENU_ENUM_LABEL_INPUT_SETTINGS:
+      case MENU_ENUM_LABEL_INPUT_INFORMATION:
       case MENU_ENUM_LABEL_SETTINGS_SHOW_INPUT:
       case MENU_ENUM_LABEL_QUICK_MENU_SHOW_CONTROLS:
       case MENU_ENUM_LABEL_UPDATE_AUTOCONFIG_PROFILES:
@@ -4529,6 +4532,8 @@ static uintptr_t xmb_icon_get_id(xmb_handle_t *xmb,
          return xmb->textures.list[XMB_TEXTURE_INPUT_SETTINGS];
       case MENU_ENUM_LABEL_INPUT_MOUSE_INDEX:
          return xmb->textures.list[XMB_TEXTURE_INPUT_MOUSE];
+      case MENU_ENUM_LABEL_INPUT_KEYBOARD_INDEX:
+         return xmb->textures.list[XMB_TEXTURE_INPUT_SETTINGS];
       case MENU_ENUM_LABEL_INPUT_PLAYER_ANALOG_DPAD_MODE:
          return xmb->textures.list[XMB_TEXTURE_INPUT_ADC];
       case MENU_ENUM_LABEL_INPUT_TURBO_FIRE_SETTINGS:
@@ -4551,7 +4556,7 @@ static uintptr_t xmb_icon_get_id(xmb_handle_t *xmb,
       case MENU_ENUM_LABEL_LATENCY_SETTINGS:
       case MENU_ENUM_LABEL_CONTENT_SHOW_LATENCY:
       case MENU_ENUM_LABEL_SETTINGS_SHOW_LATENCY:
-      case MENU_ENUM_LABEL_MENU_THROTTLE_FRAMERATE:
+      case MENU_ENUM_LABEL_MENU_FRAME_RATE:
          return xmb->textures.list[XMB_TEXTURE_LATENCY];
       case MENU_ENUM_LABEL_SAVING_SETTINGS:
       case MENU_ENUM_LABEL_SETTINGS_SHOW_SAVING:
@@ -4951,6 +4956,8 @@ static uintptr_t xmb_icon_get_id(xmb_handle_t *xmb,
             return xmb->textures.list[XMB_TEXTURE_INPUT_SETTINGS];
          else if (string_ends_with_size(enum_label, "_mouse_index", enum_label_len, STRLEN_CONST("_mouse_index")))
             return xmb->textures.list[XMB_TEXTURE_INPUT_MOUSE];
+         else if (string_ends_with_size(enum_label, "_keyboard_index", enum_label_len, STRLEN_CONST("_keyboard_index")))
+            return xmb->textures.list[XMB_TEXTURE_INPUT_SETTINGS];
          else if (string_ends_with_size(enum_label, "_analog_dpad_mode", enum_label_len, STRLEN_CONST("_analog_dpad_mode")))
             return xmb->textures.list[XMB_TEXTURE_INPUT_ADC];
          else if (string_ends_with_size(enum_label, "_bind_all", enum_label_len, STRLEN_CONST("_bind_all")))
@@ -7545,8 +7552,6 @@ static const char *xmb_texture_path(unsigned id)
          return "menu_exit.png";
       case XMB_TEXTURE_FRAMESKIP:
          return "menu_frameskip.png";
-      case XMB_TEXTURE_HELP:
-         return "menu_help.png";
       case XMB_TEXTURE_INFO:
          return "menu_info.png";
       case XMB_TEXTURE_INPUT_SETTINGS:
@@ -8572,6 +8577,7 @@ XMB_NOINLINE static void xmb_draw_bg(
       void *userdata,
       gfx_display_t *p_disp,
       gfx_display_ctx_driver_t *dispctx,
+      const gfx_display_mesh_t *ribbon_mesh,
       unsigned video_dims,
       unsigned menu_shader_pipeline,
       unsigned xmb_color_theme,
@@ -8632,40 +8638,43 @@ XMB_NOINLINE static void xmb_draw_bg(
    /* Draw pipeline */
    if (menu_shader_pipeline > XMB_SHADER_PIPELINE_WALLPAPER)
    {
+      gfx_display_mesh_draw_t md;
+      const gfx_display_mesh_t *mesh = gfx_display_mesh_fullscreen();
+
       switch (menu_shader_pipeline)
       {
          default:
          case XMB_SHADER_PIPELINE_WALLPAPER:
-            draw.pipeline_id = VIDEO_SHADER_STOCK_BLEND;
+            md.program = GFX_MESH_PROGRAM_BLEND;
             break;
          case XMB_SHADER_PIPELINE_RIBBON:
-            draw.pipeline_id = VIDEO_SHADER_MENU;
+            md.program = GFX_MESH_PROGRAM_RIBBON;
+            mesh       = ribbon_mesh;
             break;
          case XMB_SHADER_PIPELINE_SIMPLE_RIBBON:
-            draw.pipeline_id = VIDEO_SHADER_MENU_2;
+            md.program = GFX_MESH_PROGRAM_RIBBON_SIMPLE;
+            mesh       = ribbon_mesh;
             break;
 #if !defined(VITA)
          case XMB_SHADER_PIPELINE_SIMPLE_SNOW:
-            draw.pipeline_id = VIDEO_SHADER_MENU_3;
+            md.program = GFX_MESH_PROGRAM_SNOW_SIMPLE;
             break;
          case XMB_SHADER_PIPELINE_SNOW:
-            draw.pipeline_id = VIDEO_SHADER_MENU_4;
+            md.program = GFX_MESH_PROGRAM_SNOW;
             break;
          case XMB_SHADER_PIPELINE_BOKEH:
-            draw.pipeline_id = VIDEO_SHADER_MENU_5;
+            md.program = GFX_MESH_PROGRAM_BOKEH;
             break;
          case XMB_SHADER_PIPELINE_SNOWFLAKE:
-            draw.pipeline_id = VIDEO_SHADER_MENU_6;
+            md.program = GFX_MESH_PROGRAM_SNOWFLAKE;
             break;
 #endif
       }
 
-      if (dispctx->draw_pipeline)
-         dispctx->draw_pipeline(&draw, p_disp,
-               userdata, video_dims);
-
-      gfx_display_draw(dispctx, &draw, userdata,
-            video_dims);
+      md.mvp     = NULL;
+      md.color   = draw.color;
+      md.texture = draw.texture;
+      gfx_display_mesh_draw(p_disp, userdata, video_dims, mesh, &md);
    }
 #endif
 
@@ -9379,6 +9388,7 @@ static void xmb_frame(void *data, video_frame_info_t *video_info)
             userdata,
             p_disp,
             dispctx,
+            xmb->ribbon_mesh,
             video_info->dims,
             menu_shader_pipeline,
             color_theme,
@@ -10345,61 +10355,45 @@ ctx_destroyed:
    } /* end of context generation scope */
 }
 
-static void xmb_ribbon_set_vertex(float *ribbon_verts,
-      unsigned idx, unsigned row, unsigned col)
-{
-   ribbon_verts[idx++] = ((float)col) / (XMB_RIBBON_COLS - 1) * 2.0f - 1.0f;
-   ribbon_verts[idx++] = ((float)row) / (XMB_RIBBON_ROWS - 1) * 2.0f - 1.0f;
-}
-
 static void xmb_init_ribbon(xmb_handle_t * xmb)
 {
-   video_coords_t coords;
+   gfx_display_mesh_desc_t desc;
    unsigned r, c, col;
-   unsigned i                = 0;
-   gfx_display_t *p_disp     = disp_get_ptr();
-   video_coord_array_t *ca   = &p_disp->dispca;
-   unsigned vertices_total   = XMB_RIBBON_VERTICES;
-   float *ribbon_verts       = (float*)calloc(2 * vertices_total, sizeof(float));
+   unsigned i                          = 0;
+   unsigned vertices_total             = XMB_RIBBON_VERTICES;
+   gfx_display_mesh_vertex_t *vertices = (gfx_display_mesh_vertex_t*)
+      calloc(vertices_total, sizeof(*vertices));
 
-   /* NULL-check the calloc: the for-loop below unconditionally writes
-    * into ribbon_verts via xmb_ribbon_set_vertex.  Skip ribbon init
-    * entirely on OOM - the ribbon is a decorative background
-    * animation; its absence is visually degraded but not
-    * functionally broken. */
-   if (!ribbon_verts)
+   /* The ribbon is a decorative background; without memory for it the
+    * menu goes without */
+   if (!vertices)
       return;
 
-   /* Set up vertices */
+   /* One strip over the 64x64 grid, row after row, each row running
+    * back the way the one before came. The ribbon programs read the
+    * position only. */
    for (r = 0; r < XMB_RIBBON_ROWS - 1; r++)
    {
       for (c = 0; c < XMB_RIBBON_COLS; c++)
       {
          col = r % 2 ? XMB_RIBBON_COLS - c - 1 : c;
-         xmb_ribbon_set_vertex(ribbon_verts, i,     r,     col);
-         xmb_ribbon_set_vertex(ribbon_verts, i + 2, r + 1, col);
-         i  += 4;
+         vertices[i].x     = ((float)col) / (XMB_RIBBON_COLS - 1) * 2.0f - 1.0f;
+         vertices[i].y     = ((float)r)   / (XMB_RIBBON_ROWS - 1) * 2.0f - 1.0f;
+         vertices[i + 1].x = ((float)col) / (XMB_RIBBON_COLS - 1) * 2.0f - 1.0f;
+         vertices[i + 1].y = ((float)(r + 1)) / (XMB_RIBBON_ROWS - 1) * 2.0f - 1.0f;
+         i                += 2;
       }
    }
 
-   /* The ribbon vertex shaders declare exactly one attribute --
-    * "in vec3 VertexCoord" in modern_pipeline_xmb_ribbon.glsl.vert.h,
-    * "attribute vec3 VertexCoord" in the legacy one -- and every
-    * shader backend binds a stream only when its attribute location
-    * is >= 0, so colour, texture and LUT coordinates are never read
-    * back out of this array.  They used to be supplied anyway, as one
-    * calloc()ed buffer of zeros passed three times, because
-    * video_coord_array_append() copied all four streams
-    * unconditionally.  It no longer does. */
-   coords.color         = NULL;
-   coords.vertex        = ribbon_verts;
-   coords.tex_coord     = NULL;
-   coords.lut_tex_coord = NULL;
-   coords.vertices      = vertices_total;
+   desc.vertices     = vertices;
+   desc.indices      = NULL;
+   desc.vertex_count = vertices_total;
+   desc.index_count  = 0;
+   desc.topology     = GFX_MESH_TRIANGLE_STRIP;
+   desc.flags        = GFX_MESH_FLAG_POSITIONS;
+   xmb->ribbon_mesh  = gfx_display_mesh_create(&desc);
 
-   video_coord_array_append(ca, &coords, coords.vertices);
-
-   free(ribbon_verts);
+   free(vertices);
 }
 
 static void xmb_menu_animation_update_time(
@@ -10532,6 +10526,8 @@ static void xmb_free(void *data)
 
    if (xmb)
    {
+      /* Theme textures still uploading land nowhere */
+      gfx_display_texture_loads_cancel(xmb, sizeof(*xmb));
       /* Invalidate any in-flight async icon loads before freeing
        * the nodes they would write into */
       xmb_icon_load_gen++;
@@ -10545,6 +10541,9 @@ static void xmb_free(void *data)
 
       video_coord_array_free(&xmb->raster_block.carr);
       video_coord_array_free(&xmb->raster_block2.carr);
+
+      gfx_display_mesh_free(xmb->ribbon_mesh);
+      xmb->ribbon_mesh = NULL;
 
       if (xmb->box_message)
          free(xmb->box_message);
@@ -10563,6 +10562,8 @@ static void xmb_context_bg_destroy(xmb_handle_t *xmb)
    if (!xmb)
       return;
 
+   gfx_display_texture_loads_cancel(&xmb->textures.bg,
+         sizeof(xmb->textures.bg));
    video_driver_texture_unload(&xmb->textures.bg);
    gfx_display_deinit_white_texture();
 }
@@ -10579,7 +10580,7 @@ static bool xmb_load_image(void *userdata, void *data,
    {
       case MENU_IMAGE_WALLPAPER:
          xmb_context_bg_destroy(xmb);
-         video_driver_texture_load(data,
+         gfx_display_texture_load((struct texture_image*)data,
                gfx_display_texture_filter(),
                &xmb->textures.bg);
          gfx_display_init_white_texture();
@@ -10852,6 +10853,9 @@ static void xmb_context_destroy(void *data)
 
    if (!xmb)
       return;
+
+   /* Theme textures still uploading land nowhere */
+   gfx_display_texture_loads_cancel(xmb, sizeof(*xmb));
 
    /* Signal the render path to stop using textures/fonts.
     * Under threaded video, xmb_frame() may be mid-render on

@@ -325,6 +325,8 @@ enum msg_hash_enums
    MSG_NETPLAY_CLIENT_DEVICES,
    MSG_NETPLAY_CHAT_SUPPORTED,
    MSG_NETPLAY_SLOWDOWNS_CAUSED,
+   MSG_MENU_FRAME_RATE_DISPLAY,
+   MSG_MENU_FRAME_RATE_CONTENT,
    MSG_RESAMPLER_QUALITY_LOWEST,
    MSG_RESAMPLER_QUALITY_LOWER,
    MSG_RESAMPLER_QUALITY_NORMAL,
@@ -2118,6 +2120,8 @@ enum msg_hash_enums
    MENU_ENUM_LABEL_DISPLAY_INFO_ENTRY,
    MENU_ENUM_LABEL_DISPLAY_EDID_ENTRY,
    MENU_ENUM_LABEL_SYSTEM_INFO_CONTROLLER_ENTRY,
+   MENU_ENUM_LABEL_SYSTEM_INFO_KEYBOARD_ENTRY,
+   MENU_ENUM_LABEL_SYSTEM_INFO_MOUSE_ENTRY,
    MENU_ENUM_LABEL_CORE_INFO_ENTRY,
    MENU_ENUM_LABEL_CORE_MANAGER_ENTRY,
 #ifdef HAVE_MIST
@@ -2147,6 +2151,12 @@ enum msg_hash_enums
    MENU_ENUM_LABEL_INPUT_DEVICE_RESERVED_DEVICE_NAME_LAST = MENU_ENUM_LABEL_INPUT_DEVICE_RESERVED_DEVICE_NAME + MAX_USERS,
    MENU_ENUM_LABEL_INPUT_MOUSE_INDEX,
    MENU_ENUM_LABEL_INPUT_MOUSE_INDEX_LAST = MENU_ENUM_LABEL_INPUT_MOUSE_INDEX + MAX_USERS,
+   MENU_ENUM_LABEL_INPUT_KEYBOARD_INDEX,
+   MENU_ENUM_LABEL_INPUT_KEYBOARD_INDEX_LAST = MENU_ENUM_LABEL_INPUT_KEYBOARD_INDEX + MAX_USERS,
+   MENU_ENUM_LABEL_INPUT_STYLUS_ENABLE,
+   MENU_ENUM_LABEL_INPUT_STYLUS_REQUIRE_CONTACT_FOR_CLICK,
+   MENU_ENUM_LABEL_INPUT_STYLUS_HOVER_MOVES_POINTER,
+   MENU_ENUM_LABEL_INPUT_STYLUS_PRESSURE_SENSITIVITY,
    MENU_ENUM_LABEL_INPUT_REMAP_PORT,
    MENU_ENUM_LABEL_INPUT_REMAP_PORT_LAST = MENU_ENUM_LABEL_INPUT_REMAP_PORT + MAX_USERS,
 
@@ -2569,6 +2579,10 @@ enum msg_hash_enums
    MENU_ENUM_LABEL_VALUE_INPUT_MOUSE_WHEEL_DOWN,
    MENU_ENUM_LABEL_VALUE_INPUT_MOUSE_HORIZ_WHEEL_UP,
    MENU_ENUM_LABEL_VALUE_INPUT_MOUSE_HORIZ_WHEEL_DOWN,
+   MENU_ENUM_LABEL_VALUE_INPUT_STYLUS_ENABLE,
+   MENU_ENUM_LABEL_VALUE_INPUT_STYLUS_REQUIRE_CONTACT_FOR_CLICK,
+   MENU_ENUM_LABEL_VALUE_INPUT_STYLUS_HOVER_MOVES_POINTER,
+   MENU_ENUM_LABEL_VALUE_INPUT_STYLUS_PRESSURE_SENSITIVITY,
    MENU_ENUM_LABEL_VALUE_INPUT_ANALOG_LEFT_X_PLUS,
    MENU_ENUM_LABEL_VALUE_INPUT_ANALOG_LEFT_X_MINUS,
    MENU_ENUM_LABEL_VALUE_INPUT_ANALOG_LEFT_Y_PLUS,
@@ -2671,6 +2685,8 @@ enum msg_hash_enums
    MENU_ENUM_LABEL_VALUE_INPUT_BIND_DEFAULT_ALL,
    MENU_ENUM_LABEL_VALUE_INPUT_SAVE_AUTOCONFIG,
    MENU_ENUM_LABEL_VALUE_INPUT_MOUSE_INDEX,
+   MENU_ENUM_LABEL_VALUE_INPUT_KEYBOARD_INDEX,
+   MENU_ENUM_LABEL_VALUE_INPUT_KEYBOARD_INDEX_ALL,
    MENU_ENUM_LABEL_INPUT_JOYPAD_INDEX,
    MENU_ENUM_LABEL_VALUE_INPUT_DEVICE_RESERVED_DEVICE_NAME,
    MENU_ENUM_LABEL_VALUE_INPUT_DEVICE_RESERVATION_TYPE,
@@ -2688,6 +2704,11 @@ enum msg_hash_enums
    MENU_ENUM_SUBLABEL_INPUT_DEVICE_RESERVATION_TYPE,
    MENU_ENUM_LABEL_HELP_INPUT_DEVICE_RESERVATION_TYPE,
    MENU_ENUM_SUBLABEL_INPUT_MOUSE_INDEX,
+   MENU_ENUM_SUBLABEL_INPUT_KEYBOARD_INDEX,
+   MENU_ENUM_SUBLABEL_INPUT_STYLUS_ENABLE,
+   MENU_ENUM_SUBLABEL_INPUT_STYLUS_REQUIRE_CONTACT_FOR_CLICK,
+   MENU_ENUM_SUBLABEL_INPUT_STYLUS_HOVER_MOVES_POINTER,
+   MENU_ENUM_SUBLABEL_INPUT_STYLUS_PRESSURE_SENSITIVITY,
    MENU_ENUM_SUBLABEL_INPUT_ADC_TYPE,
    MENU_ENUM_LABEL_HELP_INPUT_ADC_TYPE,
    MENU_ENUM_SUBLABEL_INPUT_BIND_ALL,
@@ -5811,8 +5832,6 @@ enum msg_hash_enums
 #undef S_FLOAT_NS_H
 #undef SETTINGS_DEF_STRINGS_PASS
 #undef SETTINGS_DEF_ENUM_PASS
-   MENU_LABEL(VIDEO_FILTER_FLICKER),
-   MENU_LABEL(VIDEO_SOFT_FILTER),
    /* GENERATED REGION: video synchronization group enum rows
     * (see settings/settings_def_video_sync.h). */
 #define SETTINGS_DEF_ENUM_PASS
@@ -8176,6 +8195,186 @@ enum msg_hash_enums
 #undef S_ACTION_EX_NS_H
 #undef SETTINGS_DEF_STRINGS_PASS
 #undef SETTINGS_DEF_ENUM_PASS
+   /* GENERATED REGION: console screen filters and gamma enum rows (see settings/settings_def_video_console_screen.h). */
+#define SETTINGS_DEF_ENUM_PASS
+#define SETTINGS_DEF_STRINGS_PASS
+#define S_BOOL(f, T, n, d, sd, df, c, us, sub) MENU_LABEL(T),
+#define S_BOOL_NS(f, T, n, d, sd, df, c, us) MENU_LABEL(T),
+#define S_UINT(f, T, n, d, sd, df, c, mn, mx, st, ob, ok, rp, us, sub) MENU_LABEL(T),
+#define S_UINT_NS(f, T, n, d, sd, df, c, mn, mx, st, ob, ok, rp, us) MENU_LABEL(T),
+#define S_INT(f, T, n, d, sd, df, c, mn, mx, st, ob, ok, rp, us, sub) MENU_LABEL(T),
+#define S_INT_NS(f, T, n, d, sd, df, c, mn, mx, st, ob, ok, rp, us) MENU_LABEL(T),
+#define S_FLOAT(f, T, n, d, rnd, sd, df, c, mn, mx, st, ok, rp, us, sub) MENU_LABEL(T),
+#define S_FLOAT_NS(f, T, n, d, rnd, sd, df, c, mn, mx, st, ok, rp, us) MENU_LABEL(T),
+#define S_STRING(f, T, n, d, sd, c, ok, rp, sta, sel, lf, rt, ui, us, sub) MENU_LABEL(T),
+#define S_STRING_NS(f, T, n, d, sd, c, ok, rp, sta, sel, lf, rt, ui, us) MENU_LABEL(T),
+#define S_DIR(f, T, n, d, el, sd, c, sta, us, sub) MENU_LABEL(T),
+#define S_DIR_NS(f, T, n, d, el, sd, c, sta, us) MENU_LABEL(T),
+#define S_STRING_P(f, T, n, d, sd, c, ok, rp, sta, sel, lf, rt, ui, us, sub) MENU_LABEL(T),
+#define S_STRING_P_NS(f, T, n, d, sd, c, ok, rp, sta, sel, lf, rt, ui, us) MENU_LABEL(T),
+#define S_PATH(f, T, n, d, sd, c, vals, rp, ui, us, sub) MENU_LABEL(T),
+#define S_PATH_NS(f, T, n, d, sd, c, vals, rp, ui, us) MENU_LABEL(T),
+#define S_PATH_DS(f, T, n, df2, sd, c, vals, rp, ui, us, sub) MENU_LABEL(T),
+#define S_PATH_DS_NS(f, T, n, df2, sd, c, vals, rp, ui, us) MENU_LABEL(T),
+#define S_ACTION(T, n, us, sub) MENU_LABEL(T),
+#define S_ACTION_NS(T, n, us) MENU_LABEL(T),
+#define S_BOOL_EX(f, T, n, d, sd, df, c, ok, rp, sta, sel, lf, rt, ui, us, sub) MENU_LABEL(T),
+#define S_BOOL_EX_NS(f, T, n, d, sd, df, c, ok, rp, sta, sel, lf, rt, ui, us) MENU_LABEL(T),
+#define S_UINT_EX(f, T, n, d, sd, df, c, mn, mx, st, ob, ok, rp, sta, sel, lf, rt, ui, us, sub) MENU_LABEL(T),
+#define S_UINT_EX_NS(f, T, n, d, sd, df, c, mn, mx, st, ob, ok, rp, sta, sel, lf, rt, ui, us) MENU_LABEL(T),
+#define S_INT_EX(f, T, n, d, sd, df, c, mn, mx, st, ob, ok, rp, sta, sel, lf, rt, ui, us, sub) MENU_LABEL(T),
+#define S_INT_EX_NS(f, T, n, d, sd, df, c, mn, mx, st, ob, ok, rp, sta, sel, lf, rt, ui, us) MENU_LABEL(T),
+#define S_FLOAT_EX(f, T, n, d, rnd, sd, df, c, mn, mx, st, ok, rp, sta, sel, lf, rt, ui, us, sub) MENU_LABEL(T),
+#define S_FLOAT_EX_NS(f, T, n, d, rnd, sd, df, c, mn, mx, st, ok, rp, sta, sel, lf, rt, ui, us) MENU_LABEL(T),
+#define S_ACTION_EX(T, n, sd, ok, rp, c, us, sub) MENU_LABEL(T),
+#define S_ACTION_EX_NS(T, n, sd, ok, rp, c, us) MENU_LABEL(T),
+#define S_BOOL_H(f, T, n, d, sd, df, c, us, sub) MENU_LBL_H(T),
+#define S_UINT_H(f, T, n, d, sd, df, c, mn, mx, st, ob, ok, rp, us, sub) MENU_LBL_H(T),
+#define S_BOOL_NS_H(f, T, n, d, sd, df, c, us) MENU_LBL_H(T),
+#define S_INT_H(f, T, n, d, sd, df, c, mn, mx, st, ob, ok, rp, us, sub) MENU_LBL_H(T),
+#define S_FLOAT_H(f, T, n, d, rnd, sd, df, c, mn, mx, st, ok, rp, us, sub) MENU_LBL_H(T),
+#define S_UINT_NS_H(f, T, n, d, sd, df, c, mn, mx, st, ob, ok, rp, us) MENU_LBL_H(T),
+#define S_INT_NS_H(f, T, n, d, sd, df, c, mn, mx, st, ob, ok, rp, us) MENU_LBL_H(T),
+#define S_FLOAT_NS_H(f, T, n, d, rnd, sd, df, c, mn, mx, st, ok, rp, us) MENU_LBL_H(T),
+#define S_STRING_H(f, T, n, d, sd, c, ok, rp, sta, sel, lf, rt, ui, us, sub) MENU_LBL_H(T),
+#define S_STRING_NS_H(f, T, n, d, sd, c, ok, rp, sta, sel, lf, rt, ui, us) MENU_LBL_H(T),
+#define S_DIR_H(f, T, n, d, el, sd, c, sta, us, sub) MENU_LBL_H(T),
+#define S_DIR_NS_H(f, T, n, d, el, sd, c, sta, us) MENU_LBL_H(T),
+#define S_STRING_P_H(f, T, n, d, sd, c, ok, rp, sta, sel, lf, rt, ui, us, sub) MENU_LBL_H(T),
+#define S_STRING_P_NS_H(f, T, n, d, sd, c, ok, rp, sta, sel, lf, rt, ui, us) MENU_LBL_H(T),
+#define S_PATH_H(f, T, n, d, sd, c, vals, rp, ui, us, sub) MENU_LBL_H(T),
+#define S_PATH_NS_H(f, T, n, d, sd, c, vals, rp, ui, us) MENU_LBL_H(T),
+#define S_PATH_DS_H(f, T, n, df2, sd, c, vals, rp, ui, us, sub) MENU_LBL_H(T),
+#define S_PATH_DS_NS_H(f, T, n, df2, sd, c, vals, rp, ui, us) MENU_LBL_H(T),
+#define S_ACTION_H(T, n, us, sub) MENU_LBL_H(T),
+#define S_ACTION_NS_H(T, n, us) MENU_LBL_H(T),
+#define S_BOOL_EX_H(f, T, n, d, sd, df, c, ok, rp, sta, sel, lf, rt, ui, us, sub) MENU_LBL_H(T),
+#define S_BOOL_EX_NS_H(f, T, n, d, sd, df, c, ok, rp, sta, sel, lf, rt, ui, us) MENU_LBL_H(T),
+#define S_UINT_EX_H(f, T, n, d, sd, df, c, mn, mx, st, ob, ok, rp, sta, sel, lf, rt, ui, us, sub) MENU_LBL_H(T),
+#define S_UINT_EX_NS_H(f, T, n, d, sd, df, c, mn, mx, st, ob, ok, rp, sta, sel, lf, rt, ui, us) MENU_LBL_H(T),
+#define S_INT_EX_H(f, T, n, d, sd, df, c, mn, mx, st, ob, ok, rp, sta, sel, lf, rt, ui, us, sub) MENU_LBL_H(T),
+#define S_INT_EX_NS_H(f, T, n, d, sd, df, c, mn, mx, st, ob, ok, rp, sta, sel, lf, rt, ui, us) MENU_LBL_H(T),
+#define S_FLOAT_EX_H(f, T, n, d, rnd, sd, df, c, mn, mx, st, ok, rp, sta, sel, lf, rt, ui, us, sub) MENU_LBL_H(T),
+#define S_FLOAT_EX_NS_H(f, T, n, d, rnd, sd, df, c, mn, mx, st, ok, rp, sta, sel, lf, rt, ui, us) MENU_LBL_H(T),
+#define S_ACTION_EX_H(T, n, sd, ok, rp, c, us, sub) MENU_LBL_H(T),
+#define S_ACTION_EX_NS_H(T, n, sd, ok, rp, c, us) MENU_LBL_H(T),
+#include "settings/settings_def_video_console_screen.h"
+#undef S_BOOL
+#undef S_BOOL_NS
+#undef S_BOOL_H
+#undef S_BOOL_NS_H
+#undef S_UINT
+#undef S_UINT_NS
+#undef S_UINT_H
+#undef S_UINT_NS_H
+#undef S_INT
+#undef S_INT_NS
+#undef S_INT_H
+#undef S_INT_NS_H
+#undef S_FLOAT
+#undef S_FLOAT_NS
+#undef S_FLOAT_H
+#undef S_FLOAT_NS_H
+#undef S_STRING
+#undef S_STRING_NS
+#undef S_STRING_H
+#undef S_STRING_NS_H
+#undef S_DIR
+#undef S_DIR_NS
+#undef S_DIR_H
+#undef S_DIR_NS_H
+#undef S_STRING_P
+#undef S_STRING_P_NS
+#undef S_STRING_P_H
+#undef S_STRING_P_NS_H
+#undef S_PATH
+#undef S_PATH_NS
+#undef S_PATH_H
+#undef S_PATH_NS_H
+#undef S_PATH_DS
+#undef S_PATH_DS_NS
+#undef S_PATH_DS_H
+#undef S_PATH_DS_NS_H
+#undef S_ACTION
+#undef S_ACTION_NS
+#undef S_ACTION_H
+#undef S_ACTION_NS_H
+#undef S_BOOL_EX
+#undef S_BOOL_EX_NS
+#undef S_BOOL_EX_H
+#undef S_BOOL_EX_NS_H
+#undef S_UINT_EX
+#undef S_UINT_EX_NS
+#undef S_UINT_EX_H
+#undef S_UINT_EX_NS_H
+#undef S_INT_EX
+#undef S_INT_EX_NS
+#undef S_INT_EX_H
+#undef S_INT_EX_NS_H
+#undef S_FLOAT_EX
+#undef S_FLOAT_EX_NS
+#undef S_FLOAT_EX_H
+#undef S_FLOAT_EX_NS_H
+#undef S_ACTION_EX
+#undef S_ACTION_EX_NS
+#undef S_ACTION_EX_H
+#undef S_ACTION_EX_NS_H
+#undef S_BOOL_LV
+#undef S_BOOL_LV_NS
+#undef S_BOOL_LV_H
+#undef S_BOOL_LV_NS_H
+#undef S_FLOAT_LV
+#undef S_FLOAT_LV_NS
+#undef S_FLOAT_LV_H
+#undef S_FLOAT_LV_NS_H
+#undef S_STRING_LV
+#undef S_STRING_LV_NS
+#undef S_STRING_LV_H
+#undef S_STRING_LV_NS_H
+#undef S_ACTION_LV
+#undef S_ACTION_LV_NS
+#undef S_ACTION_LV_H
+#undef S_ACTION_LV_NS_H
+#undef S_INT_AT
+#undef S_INT_AT_NS
+#undef S_INT_AT_H
+#undef S_INT_AT_NS_H
+#undef S_UINT_AT_EX
+#undef S_UINT_AT_EX_NS
+#undef S_UINT_AT_EX_H
+#undef S_UINT_AT_EX_NS_H
+#undef S_BOOL_H
+#undef S_UINT_H
+#undef S_BOOL_NS_H
+#undef S_INT_H
+#undef S_FLOAT_H
+#undef S_UINT_NS_H
+#undef S_INT_NS_H
+#undef S_FLOAT_NS_H
+#undef S_STRING_H
+#undef S_STRING_NS_H
+#undef S_DIR_H
+#undef S_DIR_NS_H
+#undef S_STRING_P_H
+#undef S_STRING_P_NS_H
+#undef S_PATH_H
+#undef S_PATH_NS_H
+#undef S_PATH_DS_H
+#undef S_PATH_DS_NS_H
+#undef S_ACTION_H
+#undef S_ACTION_NS_H
+#undef S_BOOL_EX_H
+#undef S_BOOL_EX_NS_H
+#undef S_UINT_EX_H
+#undef S_UINT_EX_NS_H
+#undef S_INT_EX_H
+#undef S_INT_EX_NS_H
+#undef S_FLOAT_EX_H
+#undef S_FLOAT_EX_NS_H
+#undef S_ACTION_EX_H
+#undef S_ACTION_EX_NS_H
+#undef SETTINGS_DEF_STRINGS_PASS
+#undef SETTINGS_DEF_ENUM_PASS
    MENU_LABEL(VIDEO_USE_METAL_ARG_BUFFERS),
 
    /* GENERATED REGION: video output misc group enum rows (see settings/settings_def_video_output_misc.h). */
@@ -8445,7 +8644,6 @@ enum msg_hash_enums
 #undef S_FLOAT_NS_H
 #undef SETTINGS_DEF_STRINGS_PASS
 #undef SETTINGS_DEF_ENUM_PASS
-   MENU_LABEL(VIDEO_GAMMA),
 
    MENU_LABEL(VIDEO_ALLOW_ROTATE),
    MENU_ENUM_LABEL_VALUE_VIDEO_FSE_RELAXED,
@@ -9302,6 +9500,12 @@ enum msg_hash_enums
 #undef S_ACTION_EX_NS_H
 #undef SETTINGS_DEF_STRINGS_PASS
 #undef SETTINGS_DEF_ENUM_PASS
+   /* Retired: the 'Show Help' main menu toggle (menu_show_help) was
+    * removed, but the generated intl tables still name these ids
+    * until the next Crowdin fetch regenerates them without the
+    * strings. Delete these two rows after that fetch lands. */
+   MENU_ENUM_SUBLABEL_MENU_SHOW_HELP,
+   MENU_ENUM_LABEL_VALUE_MENU_SHOW_HELP,
    /* GENERATED REGION: restart visibility setting enum rows (see settings/settings_def_menu_show_restart.h). */
 #define SETTINGS_DEF_ENUM_PASS
 #define SETTINGS_DEF_STRINGS_PASS
@@ -17866,7 +18070,7 @@ enum msg_hash_enums
    MENU_ENUM_LABEL_CONNECT_NETPLAY_LAN,
 
    MENU_LABEL(MENU_ENUM_LINEAR_FILTER),
-   /* GENERATED REGION: menu throttle setting enum rows (see settings/settings_def_menu_throttle.h). */
+   /* GENERATED REGION: menu frame rate setting enum rows (see settings/settings_def_menu_frame_rate.h). */
 #define SETTINGS_DEF_ENUM_PASS
 #define SETTINGS_DEF_STRINGS_PASS
 #define S_BOOL(f, T, n, d, sd, df, c, us, sub) MENU_LABEL(T),
@@ -17937,7 +18141,7 @@ enum msg_hash_enums
 #define S_FLOAT_EX_NS_H(f, T, n, d, rnd, sd, df, c, mn, mx, st, ok, rp, sta, sel, lf, rt, ui, us) MENU_LBL_H(T),
 #define S_ACTION_EX_H(T, n, sd, ok, rp, c, us, sub) MENU_LBL_H(T),
 #define S_ACTION_EX_NS_H(T, n, sd, ok, rp, c, us) MENU_LBL_H(T),
-#include "settings/settings_def_menu_throttle.h"
+#include "settings/settings_def_menu_frame_rate.h"
 #undef S_BOOL
 #undef S_BOOL_NS
 #undef S_UINT
@@ -18000,7 +18204,6 @@ enum msg_hash_enums
 #undef S_FLOAT_NS_H
 #undef SETTINGS_DEF_STRINGS_PASS
 #undef SETTINGS_DEF_ENUM_PASS
-   MENU_LABEL(MENU_ENUM_THROTTLE_FRAMERATE),
    /* GENERATED REGION: main menu state group enum rows (see settings/settings_def_menu_main_state.h). */
 #define SETTINGS_DEF_ENUM_PASS
 #define SETTINGS_DEF_STRINGS_PASS
@@ -24835,6 +25038,18 @@ enum msg_hash_enums
    MENU_LABEL(RDB_ENTRY_FAMITSU_MAGAZINE_RATING),
    MENU_LABEL(RDB_ENTRY_TGDB_RATING),
    MENU_LABEL(RDB_ENTRY_RELEASE_MONTH),
+   MENU_ENUM_LABEL_VALUE_RDB_ENTRY_RELEASE_MONTH_JANUARY,
+   MENU_ENUM_LABEL_VALUE_RDB_ENTRY_RELEASE_MONTH_FEBRUARY,
+   MENU_ENUM_LABEL_VALUE_RDB_ENTRY_RELEASE_MONTH_MARCH,
+   MENU_ENUM_LABEL_VALUE_RDB_ENTRY_RELEASE_MONTH_APRIL,
+   MENU_ENUM_LABEL_VALUE_RDB_ENTRY_RELEASE_MONTH_MAY,
+   MENU_ENUM_LABEL_VALUE_RDB_ENTRY_RELEASE_MONTH_JUNE,
+   MENU_ENUM_LABEL_VALUE_RDB_ENTRY_RELEASE_MONTH_JULY,
+   MENU_ENUM_LABEL_VALUE_RDB_ENTRY_RELEASE_MONTH_AUGUST,
+   MENU_ENUM_LABEL_VALUE_RDB_ENTRY_RELEASE_MONTH_SEPTEMBER,
+   MENU_ENUM_LABEL_VALUE_RDB_ENTRY_RELEASE_MONTH_OCTOBER,
+   MENU_ENUM_LABEL_VALUE_RDB_ENTRY_RELEASE_MONTH_NOVEMBER,
+   MENU_ENUM_LABEL_VALUE_RDB_ENTRY_RELEASE_MONTH_DECEMBER,
    MENU_LABEL(RDB_ENTRY_RELEASE_YEAR),
    MENU_LABEL(RDB_ENTRY_MAX_USERS),
    MENU_LABEL(RDB_ENTRY_SHA1),
@@ -27374,6 +27589,7 @@ enum msg_hash_enums
    MENU_LABEL(SYSTEM_INFORMATION),
    MENU_LABEL(DISPLAY_INFORMATION),
    MENU_LABEL(DISPLAY_EDID_INFORMATION),
+   MENU_LABEL(INPUT_INFORMATION),
    MENU_LABEL(ACHIEVEMENT_LIST),
    MENU_LABEL(ACHIEVEMENT_PAUSE_MENU),
    MENU_LABEL(ACHIEVEMENT_PAUSE_CANCEL),
@@ -27642,7 +27858,6 @@ enum msg_hash_enums
 #undef SETTINGS_DEF_ENUM_PASS
    MENU_ENUM_LABEL_HELP_VIDEO_FILTER_BUILTIN,
    MENU_LABEL(VIDEO_FILTER_REMOVE),
-   MENU_LABEL(PAL60_ENABLE),
 
 
    /* GENERATED REGION: user directories group enum rows (see settings/settings_def_dir_user.h). */
@@ -31394,6 +31609,10 @@ enum msg_hash_enums
    MENU_ENUM_LABEL_VALUE_PORT,
    MENU_ENUM_LABEL_VALUE_PORT_DEVICE_NAME,
    MENU_ENUM_LABEL_VALUE_PORT_DEVICE_INFO,
+   MENU_ENUM_LABEL_VALUE_PORT_DEVICE_NO_PROFILE,
+   MENU_ENUM_LABEL_VALUE_KEYBOARD_DEVICE_NAME,
+   MENU_ENUM_LABEL_VALUE_KEYBOARD_DEVICE_INFO,
+   MENU_ENUM_LABEL_VALUE_MOUSE_DEVICE_NAME,
 
    MENU_ENUM_LABEL_VALUE_LEFT_ANALOG,
    MENU_ENUM_LABEL_VALUE_LEFT_ANALOG_FORCED,

@@ -28,6 +28,7 @@
 
 #include <retro_atomic.h>
 #include <rthreads/rthreads.h>
+#include <rthreads/retro_eventcount.h>
 #include <compat/apple_compat.h>
 #include <string/stdstring.h>
 #include <defines/cocoa_defines.h>
@@ -53,6 +54,7 @@
 #endif
 
 #include "../../configuration.h"
+#include "../../gfx/video_driver.h"
 #include "../../content.h"
 #include "../../core_info.h"
 #include "../../defaults.h"
@@ -625,16 +627,32 @@ void rarch_stop_draw_observer(void)
 
 - (BOOL)performDragOperation:(id<NSDraggingInfo>)sender
 {
-#if 0
-    NSPasteboard *pboard = [sender draggingPasteboard];
+#ifdef HAVE_MENU
+    id files = [[sender draggingPasteboard]
+          propertyListForType:RARCH_PBOARD_TYPE_FILENAMES];
 
-    if ( [[pboard types] containsObject:NSURLPboardType])
+    if ([files isKindOfClass:[NSArray class]])
     {
-        NSURL *fileURL = [NSURL URLFromPasteboard:pboard];
-        NSString    *s = [fileURL path];
+        NSUInteger i;
+        union string_list_elem_attr attr;
+        struct string_list *list = string_list_new();
+        attr.i                   = 0;
+
+        for (i = 0; list && i < [files count]; i++)
+        {
+            id file = [files objectAtIndex:i];
+            if (     [file isKindOfClass:[NSString class]]
+                  && !string_list_append(list, [file UTF8String], attr))
+            {
+                string_list_free(list);
+                list = NULL;
+            }
+        }
+        if (list && menu_driver_drop(list))
+            return YES;
     }
 #endif
-    return YES;
+    return NO;
 }
 
 - (void)draggingExited:(id <NSDraggingInfo>)sender { [self setNeedsDisplay: YES]; }
@@ -1018,50 +1036,80 @@ void *cocoa_screen_get_chosen(void)
  *
  * Written without blocks or GCD: -performSelectorOnMainThread:
  * withObject:waitUntilDone:modes: (Foundation, 10.0) carries the job
- * over in exactly those modes, and the caller waits on an rthreads
- * condition so the stall diagnostic keeps its cadence.  That makes the
- * trampoline buildable by any Objective-C compiler and runnable on
- * any release. */
+ * over in exactly those modes, and the caller waits on the job's
+ * eventcount for its done flag, in bounded waits so the stall
+ * diagnostic keeps its cadence.  That makes the trampoline buildable
+ * by any Objective-C compiler and runnable on any release.
+ *
+ * The eventcount lives in the job, and Foundation holds the job until
+ * -run has returned: the notify after the done flag cannot outlive it,
+ * however soon the caller sees the flag and lets go of its reference. */
 @interface CocoaMainThreadJob : NSObject
 {
+   retro_eventcount_t _ec;
    void (*_func)(void *userdata);
    void  *_userdata;
-   slock_t *_lock;
-   scond_t *_cond;
-   bool _done;
+   retro_atomic_int_t _done;
+   bool _ec_ready;
 }
-- (id)initWithFunc:(void (*)(void *))func userdata:(void *)userdata
-      lock:(slock_t *)lock cond:(scond_t *)cond;
+- (id)initWithFunc:(void (*)(void *))func userdata:(void *)userdata;
 - (void)run;
-- (bool)isDone;
+- (void)wait;
 @end
 
 @implementation CocoaMainThreadJob
 
 - (id)initWithFunc:(void (*)(void *))func userdata:(void *)userdata
-      lock:(slock_t *)lock cond:(scond_t *)cond
 {
    self = [super init];
    if (!self)
       return self;
+   if (!(_ec_ready = retro_eventcount_init(&_ec)))
+   {
+      RARCH_RELEASE(self);
+      return nil;
+   }
    _func     = func;
    _userdata = userdata;
-   _lock     = lock;
-   _cond     = cond;
-   _done     = false;
+   retro_atomic_int_init(&_done, 0);
    return self;
+}
+
+- (void)dealloc
+{
+   if (_ec_ready)
+      retro_eventcount_free(&_ec);
+   RARCH_SUPER_DEALLOC();
 }
 
 - (void)run
 {
    _func(_userdata);
-   slock_lock(_lock);
-   _done = true;
-   scond_signal(_cond);
-   slock_unlock(_lock);
+   retro_atomic_store_release_int(&_done, 1);
+   retro_eventcount_notify(&_ec);
 }
 
-- (bool)isDone { return _done; }
+/* Waiting forever (with periodic diagnostics) is deliberate: running
+ * the function on this thread after a timeout would run it twice once
+ * the main thread drains the job, which is far worse than a loggable
+ * stall. */
+- (void)wait
+{
+   for (;;)
+   {
+      int key;
+      if (retro_atomic_load_acquire_int(&_done))
+         return;
+      key = retro_eventcount_prepare_wait(&_ec);
+      if (retro_atomic_load_acquire_int(&_done))
+      {
+         retro_eventcount_cancel_wait(&_ec);
+         return;
+      }
+      if (!retro_eventcount_commit_wait_timeout(&_ec, key, 5000000))
+         RARCH_ERR("[Cocoa]: Main-thread trampoline stalled; main runloop is not draining scheduled jobs.\n");
+   }
+}
 
 @end
 
@@ -1070,8 +1118,6 @@ void cocoa_main_thread_sync(void (*func)(void *userdata), void *userdata)
 {
    CocoaMainThreadJob *job;
    NSArray *modes;
-   slock_t *lock;
-   scond_t *cond;
 
    if (sthread_is_main_thread())
    {
@@ -1079,10 +1125,12 @@ void cocoa_main_thread_sync(void (*func)(void *userdata), void *userdata)
       return;
    }
 
-   lock  = slock_new();
-   cond  = scond_new();
-   job   = [[CocoaMainThreadJob alloc] initWithFunc:func userdata:userdata
-         lock:lock cond:cond];
+   if (!(job = [[CocoaMainThreadJob alloc] initWithFunc:func
+               userdata:userdata]))
+   {
+      RARCH_ERR("[Cocoa]: Main-thread trampoline could not be set up.\n");
+      return;
+   }
    /* kCFRunLoopCommonModes is toll-free bridged to the NSString the
     * Foundation call wants, and is the 10.0 spelling of the 10.5
     * NSRunLoopCommonModes. */
@@ -1090,42 +1138,23 @@ void cocoa_main_thread_sync(void (*func)(void *userdata), void *userdata)
          (BRIDGE NSString *)kCFRunLoopCommonModes,
          @"com.libretro.RetroArch.MainThreadTrampoline", nil];
 
-   /* Foundation retains the job until it has run, so the reference
-    * below is released as soon as the perform is queued. */
    [job performSelectorOnMainThread:@selector(run) withObject:nil
          waitUntilDone:NO modes:modes];
    CFRunLoopWakeUp(CFRunLoopGetMain());
 
-   /* Wait for completion.  Waiting forever (with periodic diagnostics)
-    * is deliberate: falling back to running func() on this thread after
-    * a timeout would risk double-execution once the main thread finally
-    * drains the job, which is far worse than a loggable stall. */
-   slock_lock(lock);
-   while (![job isDone])
-      if (!scond_wait_timeout(cond, lock, 5000000))
-         RARCH_ERR("[Cocoa]: Main-thread trampoline stalled; main runloop is not draining scheduled jobs.\n");
-   slock_unlock(lock);
+   [job wait];
 
    RARCH_RELEASE(modes);
    RARCH_RELEASE(job);
-   scond_free(cond);
-   slock_free(lock);
 }
 
-/* One condvar-wait iteration for a caller that may be the main thread and
- * must let the worker's cocoa_main_thread_sync() blocks drain.  On the main
- * thread: a bounded timed wait, pumping the private trampoline runloop mode
- * on timeout so those marshaled blocks run (otherwise the worker blocks
- * waiting for the main thread while the main thread blocks on the reply ->
- * deadlock).  Off the main thread: returns false so the caller performs a
- * plain blocking scond_wait().  Pumping ONLY the private mode keeps draw
- * observers, timers and input sources from running reentrantly under the
- * wait.  'lock' is held on entry and on return.  Shares the trampoline mode
- * string with cocoa_main_thread_sync() above -- single source of truth. */
-/* The pump alone, for a caller on the main thread that waits on
- * something other than a condvar - a ring fence - and must let the
- * worker's marshalled blocks run between tries. Off the main thread,
- * nothing. */
+/* For a caller on the main thread that waits for the video thread and
+ * must let the worker's cocoa_main_thread_sync() blocks drain between
+ * tries (otherwise the worker blocks waiting for the main thread while
+ * the main thread blocks on it). Pumping ONLY the private trampoline
+ * mode keeps draw observers, timers and input sources from running
+ * reentrantly under the wait; the mode string is cocoa_main_thread_sync()'s.
+ * Off the main thread, nothing. */
 void cocoa_main_thread_pump(void);
 void cocoa_main_thread_pump(void)
 {
@@ -1134,22 +1163,6 @@ void cocoa_main_thread_pump(void)
    CFRunLoopRunInMode(
          CFSTR("com.libretro.RetroArch.MainThreadTrampoline"),
          0.001, false);
-}
-
-bool cocoa_main_thread_cond_wait_pump(scond_t *cond, slock_t *lock);
-bool cocoa_main_thread_cond_wait_pump(scond_t *cond, slock_t *lock)
-{
-   if (!sthread_is_main_thread())
-      return false;
-   if (!scond_wait_timeout(cond, lock, 1000))
-   {
-      slock_unlock(lock);
-      CFRunLoopRunInMode(
-            CFSTR("com.libretro.RetroArch.MainThreadTrampoline"),
-            0.001, false);
-      slock_lock(lock);
-   }
-   return true;
 }
 
 #if TARGET_OS_OSX
@@ -1299,29 +1312,27 @@ float cocoa_screen_get_native_scale(void)
  * still need a registered function.
  * --------------------------------------------------------------------- */
 
-float cocoa_get_refresh_rate(void)
-{
 #if TARGET_OS_OSX
+/* The refresh rate of one display's current mode, or 0 when it does not
+ * say - which most built-in LCDs do not. */
+static float cocoa_display_mode_refresh_rate(CGDirectDisplayID id)
+{
 #ifdef RARCH_HAS_CGDISPLAYMODE_API
    /* macOS 10.6+: CGDisplayMode API. */
-   CGDirectDisplayID main_id = CGMainDisplayID();
-   CGDisplayModeRef  mode    = CGDisplayCopyDisplayMode(main_id);
+   CGDisplayModeRef  mode    = CGDisplayCopyDisplayMode(id);
    float             rate    = 0.0f;
    if (mode)
    {
       rate = (float)CGDisplayModeGetRefreshRate(mode);
       CFRelease(mode);
    }
-   /* CGDisplayModeGetRefreshRate returns 0 on most built-in LCDs;
-    * hand the caller a sane fallback instead of 0 Hz. */
-   return (rate > 0.0f) ? rate : 60.0f;
+   return rate;
 #else
    /* macOS 10.5 Leopard: CGDisplayCopyDisplayMode doesn't exist.
     * CGDisplayCurrentMode returns a borrowed CFDictionaryRef
     * (do NOT CFRelease) carrying kCGDisplayRefreshRate.  Deprecated
     * in 10.6 but the only option on the 10.5 SDK. */
-   CGDirectDisplayID main_id = CGMainDisplayID();
-   CFDictionaryRef   mode    = CGDisplayCurrentMode(main_id);
+   CFDictionaryRef   mode    = CGDisplayCurrentMode(id);
    double            rate    = 0.0;
    if (mode)
    {
@@ -1330,8 +1341,18 @@ float cocoa_get_refresh_rate(void)
       if (n)
          CFNumberGetValue(n, kCFNumberDoubleType, &rate);
    }
-   return (rate > 0.0) ? (float)rate : 60.0f;
+   return (rate > 0.0) ? (float)rate : 0.0f;
 #endif
+}
+#endif
+
+float cocoa_get_refresh_rate(void)
+{
+#if TARGET_OS_OSX
+   float rate = cocoa_display_mode_refresh_rate(CGMainDisplayID());
+   /* CGDisplayModeGetRefreshRate returns 0 on most built-in LCDs;
+    * hand the caller a sane fallback instead of 0 Hz. */
+   return (rate > 0.0f) ? rate : 60.0f;
 #else /* iOS / tvOS */
    /* Prefer the panel's own capability over the CADisplayLink's
     * preferred rate.
@@ -1391,6 +1412,97 @@ float cocoa_get_refresh_rate(void)
       return [UIScreen mainScreen].maximumFramesPerSecond;
 #endif
    return 60.0f;
+#endif
+}
+
+/* The refresh rate of the screen the RetroArch window is on, which on a
+ * Mac with several displays, or an iPad driving an external one, is not
+ * necessarily the main screen; 0 when there is no window yet or the
+ * screen does not say. The view is read without +get, which would make
+ * one. */
+float cocoa_get_window_refresh_rate(void)
+{
+   CocoaView *view = (BRIDGE CocoaView*)nsview_get_ptr();
+#if TARGET_OS_OSX
+   NSWindow *window = view ? [view window] : nil;
+   NSScreen *screen = window ? [window screen] : nil;
+   NSNumber *number;
+   float     rate   = 0.0f;
+
+   if (!screen)
+      return 0.0f;
+   number = [[screen deviceDescription] objectForKey:@"NSScreenNumber"];
+   if (number)
+      rate = cocoa_display_mode_refresh_rate(
+            (CGDirectDisplayID)[number unsignedIntValue]);
+   if (rate > 0.0f)
+      return rate;
+   /* A built-in panel, whose mode carries no rate: the screen's own
+    * figure, which is its current rate on a fixed panel and its top
+    * rate on a ProMotion one */
+#if __MAC_OS_X_VERSION_MAX_ALLOWED >= 120000
+   if (apple_runtime_available(APPLE_RUNTIME_VER(12, 0, 0), 0, 0))
+   {
+      NSInteger max_fps = [screen maximumFramesPerSecond];
+      if (max_fps > 0)
+         return (float)max_fps;
+   }
+#endif
+   return 0.0f;
+#else /* iOS / tvOS */
+   UIScreen *screen = (view && view.view.window) ? view.view.window.screen : nil;
+
+   if (!screen)
+      return 0.0f;
+#if __IPHONE_OS_VERSION_MAX_ALLOWED >= 100300 || __TV_OS_VERSION_MAX_ALLOWED >= 100200
+   if (apple_runtime_available(0, APPLE_RUNTIME_VER(10, 3, 0), APPLE_RUNTIME_VER(10, 2, 0)))
+   {
+      NSInteger max_fps = [screen maximumFramesPerSecond];
+      if (max_fps > 0)
+         return (float)max_fps;
+   }
+#endif
+   return 0.0f;
+#endif
+}
+
+/* Tells the frontend when the window may be on another screen, or its
+ * screen has changed mode, so the next reading of its refresh rate is
+ * taken afresh (see video_driver_window_output_changed()). Posted on
+ * the main thread, which is the one that reads it. */
+@interface RAWindowOutputObserver : NSObject
+- (void)outputChanged:(NSNotification *)notification;
+@end
+
+@implementation RAWindowOutputObserver
+- (void)outputChanged:(NSNotification *)notification
+{
+   video_driver_window_output_changed();
+}
+@end
+
+void cocoa_watch_window_output(void)
+{
+   /* Process lifetime: never removed, so never released */
+   static RAWindowOutputObserver *observer = nil;
+   NSNotificationCenter *center;
+
+   if (observer)
+      return;
+   observer = [[RAWindowOutputObserver alloc] init];
+   center   = [NSNotificationCenter defaultCenter];
+#if TARGET_OS_OSX
+   [center addObserver:observer selector:@selector(outputChanged:)
+                  name:NSWindowDidChangeScreenNotification object:nil];
+   [center addObserver:observer selector:@selector(outputChanged:)
+                  name:NSApplicationDidChangeScreenParametersNotification object:nil];
+#else
+   [center addObserver:observer selector:@selector(outputChanged:)
+                  name:UIScreenModeDidChangeNotification object:nil];
+   [center addObserver:observer selector:@selector(outputChanged:)
+                  name:UIScreenDidConnectNotification object:nil];
+   [center addObserver:observer selector:@selector(outputChanged:)
+                  name:UIScreenDidDisconnectNotification object:nil];
 #endif
 }
 

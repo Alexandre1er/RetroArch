@@ -7,10 +7,10 @@ set -e
 cd "$(dirname "$0")"
 command -v smbd >/dev/null 2>&1 || { echo "skip: no smbd"; exit 0; }
 [ "$(id -u)" = 0 ] || { echo "skip: needs root for port 445"; exit 0; }
-make -s smb_test vfs_test vfs_threads_test
+make -s smb_test vfs_test vfs_threads_test smb_idle_test
 # WITH_LIBSMB2=1: the VFS tests over a system libsmb2 as well (the
 # --enable-libsmb build), on every case the built-in client passes
-[ -n "${WITH_LIBSMB2:-}" ] && make -s vfs_test_libsmb2 vfs_threads_test_libsmb2
+[ -n "${WITH_LIBSMB2:-}" ] && make -s vfs_test_libsmb2 vfs_threads_test_libsmb2 smb_idle_test_libsmb2
 RUN=${RUNNER:-}
 EXE=${EXE:-}
 D=$(mktemp -d); chmod 755 $D; mkdir -p $D/share $D/priv $D/run /run/samba
@@ -49,6 +49,7 @@ cat > $D/smb.conf << EOC
    server max protocol = $1
    server signing = mandatory
    smb encrypt = $2
+   ${3:+server smb3 signing algorithms = $3}
 [share]
    path = $D/share
    read only = no
@@ -65,7 +66,7 @@ run() { # label max_protocol encrypt expect_rc password
    # smbd and the samba-dcerpcd it spawned for this config; a stale
    # rpc daemon from a previous run answers the srvsvc pipe for nobody
    stop; sleep 0.3
-   conf $2 $3
+   conf $2 $3 "${SIGN_ALGS:-}"
    smbd -s $D/smb.conf -D
    # wait for the listener rather than guessing a delay
    i=0; while [ $i -lt 50 ]; do
@@ -91,7 +92,13 @@ run "SMB 2.0.2, HMAC-SHA256 signing"        SMB2_02 default  0 'Sekret1!'
 run "SMB 2.1, HMAC-SHA256 signing"          SMB2_10 default  0 'Sekret1!'
 run "SMB 3.0, AES-CMAC signing"             SMB3_00 default  0 'Sekret1!'
 run "SMB 3.0.2, AES-CMAC signing"           SMB3_02 default  0 'Sekret1!'
-run "SMB 3.1.1, preauth + AES-CMAC signing" SMB3_11 default  0 'Sekret1!'
+# 3.1.1 offers GMAC and CMAC: Samba's default list takes GMAC; a server
+# that allows only CMAC gets CMAC. smb_test checks which was chosen.
+export SMB_EXPECT_SIGN=2
+run "SMB 3.1.1, preauth + AES-GMAC signing" SMB3_11 default 0 'Sekret1!'
+SIGN_ALGS=AES-128-CMAC; SMB_EXPECT_SIGN=1
+run "SMB 3.1.1, preauth + AES-CMAC signing (server allows no GMAC)" SMB3_11 default 0 'Sekret1!'
+SIGN_ALGS=; unset SMB_EXPECT_SIGN
 run "SMB 3.0.2, AES-CCM sealing required"   SMB3_02 required 0 'Sekret1!'
 run "SMB 3.1.1, AES-GCM sealing required"   SMB3_11 required 0 'Sekret1!'
 # A guest / anonymous session is returned unsigned even under mandatory
@@ -148,4 +155,29 @@ else
    echo "FAIL: Kerberos fallback: $(cat $D/out)"; exit 1
 fi
 rm -f $D/share/rsmb_test.bin
+
+# smb:// files kept open across a server restart (a NAS rebooting):
+# the stream mends its connection, opens its file again and goes on
+# from where it was - the read first, then the write first, since the
+# first call after the restart is the one that finds it gone.
+restart_round() { # binary order label
+   rm -f $D/share/idle.bin $D/share/idle_w.bin
+   stop; sleep 0.3; conf SMB3_11 default; smbd -s $D/smb.conf -D; sleep 1
+   $RUN ./$1$EXE 127.0.0.1 share rsmbtest 'Sekret1!' RETRO 10 $2 >$D/out 2>&1 &
+   idler=$!
+   sleep 3
+   stop; i=0; while pgrep -f "smbd -s $D/smb.conf" >/dev/null 2>&1 && [ $i -lt 30 ]; do sleep 0.2; i=$((i + 1)); done
+   smbd -s $D/smb.conf -D
+   if wait $idler; then
+      echo "ok:   $3: files read and written across a server restart ($2 first)"
+   else
+      echo "FAIL: $3 across a server restart ($2 first): $(cat $D/out)"; exit 1
+   fi
+}
+restart_round smb_idle_test r "built-in client"
+restart_round smb_idle_test w "built-in client"
+if [ -n "${WITH_LIBSMB2:-}" ]; then
+   restart_round smb_idle_test_libsmb2 r "libsmb2"
+   restart_round smb_idle_test_libsmb2 w "libsmb2"
+fi
 echo "[pass] smb_retro local samba matrix"

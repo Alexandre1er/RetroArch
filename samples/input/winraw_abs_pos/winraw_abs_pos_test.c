@@ -51,6 +51,15 @@ void RARCH_DBG(const char *fmt, ...) { (void)fmt; }
 void RARCH_ERR(const char *fmt, ...) { (void)fmt; }
 void input_config_set_mouse_display_name(unsigned port, const char *name)
 { (void)port; (void)name; }
+void input_config_set_keyboard_display_name(unsigned idx, const char *name)
+{ (void)idx; (void)name; }
+void input_config_clear_keyboard_display_names(void) { }
+void input_config_clear_mouse_info(void) { }
+void input_config_set_mouse_device(unsigned idx, const char *device,
+      uint16_t vid, uint16_t pid, bool hidden)
+{ (void)idx; (void)device; (void)vid; (void)pid; (void)hidden; }
+void input_config_set_keyboard_ids(unsigned idx, uint16_t vid, uint16_t pid)
+{ (void)idx; (void)vid; (void)pid; }
 unsigned input_driver_lightgun_id_convert(unsigned id) { return id; }
 bool input_driver_pointer_is_offscreen(int16_t x, int16_t y)
 { (void)x; (void)y; return false; }
@@ -80,6 +89,10 @@ bool video_driver_translate_coord_viewport(struct video_viewport *vp,
 uintptr_t video_driver_window_get(void) { return 0; }
 void win32_clip_window(bool grab) { (void)grab; }
 uint16_t win32_get_keyboard_mods(void) { return 0; }
+void winraw_joypad_take_hid(HANDLE device, const BYTE *data,
+      DWORD report_size, DWORD count)
+{ (void)device; (void)data; (void)report_size; (void)count; }
+bool winraw_joypad_survives_video(void) { return true; }
 void win32_hotplug_arm(void) { }
 bool win32_hotplug_due(void) { return false; }
 

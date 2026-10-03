@@ -260,8 +260,8 @@ static struct smb2_context *smb_connect_with(const struct smb_conn_key *key, int
    smb2_set_authentication(ctx, auth);
 #ifdef HAVE_RETROSMB
    smb2_set_kerberos(ctx, key->realm, key->kdc, 0);
-   if (key->readahead)
-      smb2_set_readahead(ctx, key->readahead * 1024);
+   /* 0 is off: one request per read, as before read-ahead existed */
+   smb2_set_readahead(ctx, key->readahead * 1024);
 #endif
    if (smb2_connect_share(ctx, key->server_address, key->share, username) < 0)
    {
@@ -441,9 +441,34 @@ static struct smb2_context *smb_heal(struct smb2_context *ctx, struct smb_slot *
  * is pumped here off a context of its own.  srvsvc requires IPC$, which is a
  * different tree connect to the one the pool holds. */
 #ifndef HAVE_RETROSMB
+/* libsmb2 changed its share enumeration types in place (upstream
+ * 48e2461, 2026-10-01): the srvsvc_* structures, SHARE_INFO_1 and
+ * SRVSVC_SHARE_TYPE_* gave way to a flat smb2_share_enum_reply,
+ * SMB2_SHARE_INFO_1 and SMB2_SHARE_TYPE_*. The call and the level-1
+ * fields used here are the same in both, so map the names. */
+#ifdef SMB2_SHARE_TYPE_DISKTREE
+typedef struct smb2_share_enum_reply smb_share_rep_t;
+typedef struct smb2_share_info_1     smb_share_info1_t;
+#define SMB_SHARE_LEVEL_1         SMB2_SHARE_INFO_1
+#define SMB_STYPE_DISKTREE        SMB2_SHARE_TYPE_DISKTREE
+#define SMB_STYPE_HIDDEN          SMB2_SHARE_TYPE_HIDDEN
+#define SMB_STYPE_TEMPORARY       SMB2_SHARE_TYPE_TEMPORARY
+#define SMB_REP_COUNT(rep)        ((rep)->entries_read)
+#define SMB_REP_INFO1(rep)        ((rep)->share_info.info_1)
+#else
+typedef struct srvsvc_NetrShareEnum_rep smb_share_rep_t;
+typedef struct srvsvc_SHARE_INFO_1      smb_share_info1_t;
+#define SMB_SHARE_LEVEL_1         SHARE_INFO_1
+#define SMB_STYPE_DISKTREE        SRVSVC_SHARE_TYPE_DISKTREE
+#define SMB_STYPE_HIDDEN          SRVSVC_SHARE_TYPE_HIDDEN
+#define SMB_STYPE_TEMPORARY       SRVSVC_SHARE_TYPE_TEMPORARY
+#define SMB_REP_COUNT(rep)        ((rep)->ses.ShareEnum.Level1.EntriesRead)
+#define SMB_REP_INFO1(rep)        ((rep)->ses.ShareEnum.Level1.share_info_1)
+#endif
+
 struct smb_enum_state
 {
-   struct srvsvc_NetrShareEnum_rep *rep;
+   smb_share_rep_t *rep;
    int status;
    bool finished;
 };
@@ -456,7 +481,7 @@ static void smb_share_enum_cb(struct smb2_context *ctx, int status,
    (void)ctx;
 
    state->status   = status;
-   state->rep      = (struct srvsvc_NetrShareEnum_rep*)command_data;
+   state->rep      = (smb_share_rep_t*)command_data;
    state->finished = true;
 }
 
@@ -578,7 +603,8 @@ static bool smb_enum_shares(char ***out, unsigned *out_count)
    const struct smb_settings *smb_cfg = smb_cfg_get();
    struct smb_enum_state state;
    struct smb2_context *ctx;
-   struct srvsvc_SHARE_INFO_1_CONTAINER *level1;
+   const smb_share_info1_t *info1;
+   uint32_t entries;
    char **shares;
    unsigned count = 0;
    unsigned i;
@@ -628,7 +654,7 @@ static bool smb_enum_shares(char ***out, unsigned *out_count)
 
    memset(&state, 0, sizeof(state));
 
-   if (smb2_share_enum_async(ctx, SHARE_INFO_1,
+   if (smb2_share_enum_async(ctx, SMB_SHARE_LEVEL_1,
             smb_share_enum_cb, &state) != 0)
    {
       smb2_disconnect_share(ctx);
@@ -647,9 +673,10 @@ static bool smb_enum_shares(char ***out, unsigned *out_count)
       return false;
    }
 
-   level1 = &state.rep->ses.ShareEnum.Level1;
+   info1   = SMB_REP_INFO1(state.rep);
+   entries = SMB_REP_COUNT(state.rep);
 
-   if (!level1->share_info_1 || level1->EntriesRead == 0)
+   if (!info1 || entries == 0)
    {
       smb2_free_data(ctx, state.rep);
       smb2_disconnect_share(ctx);
@@ -657,7 +684,7 @@ static bool smb_enum_shares(char ***out, unsigned *out_count)
       return false;
    }
 
-   if (!(shares = (char**)calloc(level1->EntriesRead, sizeof(char*))))
+   if (!(shares = (char**)calloc(entries, sizeof(char*))))
    {
       smb2_free_data(ctx, state.rep);
       smb2_disconnect_share(ctx);
@@ -665,16 +692,16 @@ static bool smb_enum_shares(char ***out, unsigned *out_count)
       return false;
    }
 
-   for (i = 0; i < level1->EntriesRead; i++)
+   for (i = 0; i < entries; i++)
    {
-      const struct srvsvc_SHARE_INFO_1 *info = &level1->share_info_1[i];
+      const smb_share_info1_t *info = &info1[i];
       const char *name = info->netname;
 
       if (!name || !*name)
          continue;
-      if ((info->type & 3) != SRVSVC_SHARE_TYPE_DISKTREE)
+      if ((info->type & 3) != SMB_STYPE_DISKTREE)
          continue;
-      if (info->type & (SRVSVC_SHARE_TYPE_HIDDEN | SRVSVC_SHARE_TYPE_TEMPORARY))
+      if (info->type & (SMB_STYPE_HIDDEN | SMB_STYPE_TEMPORARY))
          continue;
       if (name[strlen(name) - 1] == '$')
          continue;
@@ -777,7 +804,20 @@ struct smb_prefetch
    struct smb2_context *ctx;
    struct smb_slot     *slot;
    struct smb2fh       *fh;
+   uint64_t             from_window;  /* octets served by the prefetcher */
+   uint64_t             direct;       /* octets it missed, read directly */
 };
+
+/* What the prefetchers served and missed, in KiB, over the streams
+ * closed since smb_take_readahead_stats() last took them. */
+static retro_atomic_int_t smb_ra_window_kib;
+static retro_atomic_int_t smb_ra_direct_kib;
+
+void smb_take_readahead_stats(unsigned *window_kib, unsigned *direct_kib)
+{
+   *window_kib = (unsigned)retro_atomic_exchange_int(&smb_ra_window_kib, 0);
+   *direct_kib = (unsigned)retro_atomic_exchange_int(&smb_ra_direct_kib, 0);
+}
 
 #ifdef HAVE_THREADS
 static int64_t smb_prefetch_fetch(void *user, uint64_t off, uint8_t *buf, size_t len)
@@ -800,15 +840,18 @@ static int64_t smb_prefetch_fetch(void *user, uint64_t off, uint8_t *buf, size_t
 #endif
 
 /* Start prefetching @path for a stream opened read-only. Nothing
- * happens without threads, or without a spare connection, or when the
- * window is off: the stream then reads as before. */
+ * happens without threads, without a spare connection, or with
+ * read-ahead off: the stream then reads as before, holding no second
+ * connection and no thread. */
 static void smb_prefetch_start(libretro_vfs_implementation_file *stream,
       const char *share, const char *path)
 {
 #ifdef HAVE_THREADS
    const struct smb_settings *cfg = smb_cfg_get();
    struct smb_prefetch *sp;
-   size_t window = (cfg && cfg->readahead) ? (size_t)cfg->readahead * 1024 : 1024 * 1024;
+   size_t window = cfg ? (size_t)cfg->readahead * 1024 : 0;
+   if (!window)
+      return;
    if (!(sp = (struct smb_prefetch*)calloc(1, sizeof(*sp))))
       return;
    if (!(sp->ctx = smb_take(share, &sp->slot)))
@@ -846,18 +889,89 @@ static void smb_prefetch_stop(libretro_vfs_implementation_file *stream)
    if (!sp)
       return;
    vfs_prefetch_free(sp->p);              /* joins the thread first */
+   retro_atomic_fetch_add_int(&smb_ra_window_kib, (int)((sp->from_window + 512) >> 10));
+   retro_atomic_fetch_add_int(&smb_ra_direct_kib, (int)((sp->direct + 512) >> 10));
    if (smb_ctx_active(sp->ctx))
       smb2_close(sp->ctx, sp->fh);
 #ifdef HAVE_RETROSMB
    {
       /* the pooled connection goes back with its window as configured */
       const struct smb_settings *cfg = smb_cfg_get();
-      smb2_set_readahead(sp->ctx, (cfg && cfg->readahead) ? cfg->readahead * 1024 : 1024 * 1024);
+      smb2_set_readahead(sp->ctx, cfg ? cfg->readahead * 1024 : 0);
    }
 #endif
    smb_give(sp->ctx, sp->slot);
    free(sp);
    stream->smb_prefetch = (intptr_t)0;
+}
+
+#ifndef HAVE_RETROSMB
+static void smb_close_dropped(struct smb2_context *ctx, int status,
+      void *command_data, void *private_data)
+{
+   (void)ctx; (void)status; (void)command_data; (void)private_data;
+}
+#endif
+
+/* How a stream's file is opened again after its connection went: the
+ * share, the path in it, and the open flags less create and truncate,
+ * so opening again never loses what was written. */
+struct smb_reopen
+{
+   char share[256];
+   char path[PATH_MAX_LENGTH];
+   int  flags;
+};
+
+/* The stream's connection went - the server restarted, or dropped it
+ * after an idle spell - or its handle did: the connection is mended in
+ * place, the file opened again, and the position restored, so the call
+ * that found it can go on. Its position is the client's own record,
+ * good whatever happened to the server. */
+static bool smb_stream_mend(libretro_vfs_implementation_file *stream)
+{
+   struct smb_reopen   *ro   = (struct smb_reopen*)(void*)(uintptr_t)stream->smb_reopen;
+   struct smb2_context *ctx  = (struct smb2_context*)(void*)(uintptr_t)stream->smb_ctx;
+   struct smb_slot     *slot = (struct smb_slot*)(void*)(uintptr_t)stream->smb_slot;
+   struct smb2fh       *fh   = (struct smb2fh*)(void*)(uintptr_t)stream->smb_fh;
+   struct smb2_context *fresh;
+   bool                 prefetch = stream->smb_prefetch != 0;
+   uint64_t             pos      = 0;
+
+   if (!ro || !ctx || !fh)
+      return false;
+   smb2_lseek(ctx, fh, 0, SEEK_CUR, &pos);
+   if (prefetch)
+      smb_prefetch_stop(stream);
+   if (smb_ctx_active(ctx) && smb2_echo(ctx) == 0)
+      smb2_close(ctx, fh);                 /* the connection lives: only the handle went */
+   else
+   {
+#ifndef HAVE_RETROSMB
+      /* libsmb2 frees a handle only through its close: queued here (it
+       * sends nothing yet), it is answered with a shutdown, and the
+       * handle freed, as the dead context is let go below. The built-in
+       * client frees a context's files with it. */
+      smb2_close_async(ctx, fh, smb_close_dropped, NULL);
+#endif
+      if (!(fresh = smb_heal(ctx, slot, ro->share)))
+      {
+         stream->smb_fh = (intptr_t)0;
+         return false;
+      }
+      ctx = fresh;                         /* the old one went, handles and all */
+   }
+   stream->smb_ctx = (intptr_t)(uintptr_t)ctx;
+   if (!(fh = smb2_open(ctx, ro->path, ro->flags)))
+   {
+      stream->smb_fh = (intptr_t)0;
+      return false;
+   }
+   smb2_lseek(ctx, fh, (int64_t)pos, SEEK_SET, NULL);
+   stream->smb_fh = (intptr_t)(uintptr_t)fh;
+   if (prefetch)
+      smb_prefetch_start(stream, ro->share, ro->path);
+   return true;
 }
 
 bool retro_vfs_file_open_smb(libretro_vfs_implementation_file *stream,
@@ -926,6 +1040,16 @@ bool retro_vfs_file_open_smb(libretro_vfs_implementation_file *stream,
    stream->smb_fh   = (intptr_t)(uintptr_t)fh;
    stream->smb_ctx  = (intptr_t)(uintptr_t)smb_context;
    stream->smb_slot = (intptr_t)(uintptr_t)slot;
+   {
+      struct smb_reopen *ro = (struct smb_reopen*)malloc(sizeof(*ro));
+      if (ro)
+      {
+         strlcpy(ro->share, share, sizeof(ro->share));
+         strlcpy(ro->path, full_path, sizeof(ro->path));
+         ro->flags = flags & ~(O_CREAT | O_TRUNC | O_EXCL);
+      }
+      stream->smb_reopen = (intptr_t)(uintptr_t)ro;
+   }
    stream->scheme   = VFS_SCHEME_SMB; /* ensure SMB dispatch on IO calls */
    if (flags == O_RDONLY)
       smb_prefetch_start(stream, share, full_path);
@@ -937,6 +1061,7 @@ int64_t retro_vfs_file_read_smb(libretro_vfs_implementation_file *stream,
 {
    uint8_t *ptr               = (uint8_t*)s;
    uint64_t total             = 0;
+   bool mended                = false;
    struct smb2_context *ctx;
    struct smb2fh *fh;
 
@@ -947,8 +1072,15 @@ int64_t retro_vfs_file_read_smb(libretro_vfs_implementation_file *stream,
       return 0;
 
    ctx = (struct smb2_context *)(void *)(uintptr_t)stream->smb_ctx;
-   if (!ctx || !smb_ctx_active(ctx))
+   if (!ctx)
       return -1;
+   if (!smb_ctx_active(ctx))
+   {
+      if (!smb_stream_mend(stream))
+         return -1;
+      mended = true;
+      ctx    = (struct smb2_context *)(void *)(uintptr_t)stream->smb_ctx;
+   }
 
    fh = (struct smb2fh *)(intptr_t)stream->smb_fh;
    if (!fh)
@@ -966,6 +1098,7 @@ int64_t retro_vfs_file_read_smb(libretro_vfs_implementation_file *stream,
          if (got >= 0)
          {
             smb2_lseek(ctx, fh, got, SEEK_CUR, NULL);
+            sp->from_window += (uint64_t)got;
             return got;
          }
       }
@@ -985,6 +1118,18 @@ int64_t retro_vfs_file_read_smb(libretro_vfs_implementation_file *stream,
          want = UINT32_MAX;
 
       ret = smb2_read(ctx, fh, ptr + total, (uint32_t)want);
+      if (ret < 0 && !mended)
+      {
+         /* the connection or the handle went: mend it and read on from
+          * the position the stream had reached */
+         mended = true;
+         if (smb_stream_mend(stream))
+         {
+            ctx = (struct smb2_context *)(void *)(uintptr_t)stream->smb_ctx;
+            fh  = (struct smb2fh *)(intptr_t)stream->smb_fh;
+            continue;
+         }
+      }
       if (ret < 0)
          return (total > 0) ? (int64_t)total : -1;
       if (ret == 0)
@@ -993,6 +1138,9 @@ int64_t retro_vfs_file_read_smb(libretro_vfs_implementation_file *stream,
       total += (uint64_t)ret;
    }
 
+   /* a read the prefetcher had nothing ready for */
+   if (stream->smb_prefetch)
+      ((struct smb_prefetch*)(void*)(uintptr_t)stream->smb_prefetch)->direct += total;
    return (int64_t)total;
 }
 
@@ -1001,6 +1149,7 @@ int64_t retro_vfs_file_write_smb(libretro_vfs_implementation_file *stream,
 {
    const uint8_t *ptr         = (const uint8_t*)s;
    uint64_t total             = 0;
+   bool mended                = false;
    struct smb2_context *ctx;
    struct smb2fh *fh;
 
@@ -1011,8 +1160,15 @@ int64_t retro_vfs_file_write_smb(libretro_vfs_implementation_file *stream,
       return 0;
 
    ctx = (struct smb2_context *)(void *)(uintptr_t)stream->smb_ctx;
-   if (!ctx || !smb_ctx_active(ctx))
+   if (!ctx)
       return -1;
+   if (!smb_ctx_active(ctx))
+   {
+      if (!smb_stream_mend(stream))
+         return -1;
+      mended = true;
+      ctx    = (struct smb2_context *)(void *)(uintptr_t)stream->smb_ctx;
+   }
 
    fh = (struct smb2fh *)(intptr_t)stream->smb_fh;
    if (!fh)
@@ -1028,6 +1184,18 @@ int64_t retro_vfs_file_write_smb(libretro_vfs_implementation_file *stream,
          want = UINT32_MAX;
 
       ret = smb2_write(ctx, fh, ptr + total, (uint32_t)want);
+      if (ret < 0 && !mended)
+      {
+         /* the connection or the handle went: mend it and write this
+          * piece again at the position the stream had reached */
+         mended = true;
+         if (smb_stream_mend(stream))
+         {
+            ctx = (struct smb2_context *)(void *)(uintptr_t)stream->smb_ctx;
+            fh  = (struct smb2fh *)(intptr_t)stream->smb_fh;
+            continue;
+         }
+      }
       if (ret < 0)
          return (total > 0) ? (int64_t)total : -1;
       if (ret == 0)
@@ -1058,8 +1226,15 @@ int64_t retro_vfs_file_seek_smb(libretro_vfs_implementation_file *stream,
       return -1;
 
    ctx = (struct smb2_context *)(void *)(uintptr_t)stream->smb_ctx;
-   if (!ctx || !smb_ctx_active(ctx))
+   if (!ctx)
       return -1;
+   if (!smb_ctx_active(ctx))
+   {
+      if (!smb_stream_mend(stream))
+         return -1;
+      ctx = (struct smb2_context *)(void *)(uintptr_t)stream->smb_ctx;
+      fh  = (struct smb2fh *)(void *)(uintptr_t)stream->smb_fh;
+   }
 
    /* Only allow valid values */
    if (whence != SEEK_SET && whence != SEEK_CUR && whence != SEEK_END)
@@ -1118,6 +1293,8 @@ int retro_vfs_file_close_smb(libretro_vfs_implementation_file *stream)
    stream->smb_fh   = (intptr_t)-1;
    stream->smb_ctx  = (intptr_t)0;
    stream->smb_slot = (intptr_t)0;
+   free((void*)(uintptr_t)stream->smb_reopen);
+   stream->smb_reopen = (intptr_t)0;
    smb_give(ctx, slot);
    return ret;
 }

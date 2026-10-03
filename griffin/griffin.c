@@ -628,10 +628,10 @@ VIDEO DRIVER
 #include "../gfx/common/dxgi_common.c"
 #endif
 
-#if defined(GEKKO)
+#if defined(GEKKO) && defined(HAVE_LIBOGC)
 #ifdef HW_RVL
-#include "../gfx/drivers/gx_gfx_vi_encoder.c"
-#include "../libretro-common/memory/mem2_manager.c"
+#include "../gfx/drivers/gx_gfx_vi_encoder_libogc.c"
+#include "../libretro-common/memory/mem2_manager_libogc.c"
 #endif
 #endif
 
@@ -705,8 +705,13 @@ VIDEO DRIVER
 #include "../gfx/drivers/rsx_gfx.c"
 #elif defined(GEKKO)
 #include "../gfx/display_servers/dispserv_gx_modes.c"
-#include "../gfx/display_servers/dispserv_gx.c"
-#include "../gfx/drivers/gx_gfx.c"
+#ifdef HAVE_LIBOGC
+#include "../gfx/display_servers/dispserv_gx_libogc.c"
+#include "../gfx/drivers/gx_gfx_libogc.c"
+#else
+#include "../gfx/display_servers/dispserv_gekko.c"
+#include "../gfx/drivers/gekko_gfx.c"
+#endif
 #elif defined(PSP)
 #include "../gfx/drivers/psp1_gfx.c"
 #elif defined(PS2)
@@ -750,6 +755,7 @@ INPUT
 ============================================================ */
 
 #include "../input/input_driver.c"
+#include "../input/input_driver_choice.c"
 #include "../input/input_overlay_textures.c"
 #include "../input/input_overlay_alpha.c"
 #ifdef HAVE_BSV_MOVIE
@@ -802,7 +808,11 @@ INPUT
 #include "../input/drivers_joypad/ctr_joypad.c"
 #elif defined(GEKKO)
 #include "../input/drivers/gx_input.c"
-#include "../input/drivers_joypad/gx_joypad.c"
+#ifdef HAVE_LIBOGC
+#include "../input/drivers_joypad/gx_joypad_libogc.c"
+#else
+#include "../input/drivers_joypad/gekko_joypad.c"
+#endif
 #elif defined(__wiiu__)
 #include "../input/common/hid/hid_device_driver.c"
 #include "../input/common/hid/device_wiiu_gca.c"
@@ -911,7 +921,11 @@ INPUT (HID)
 #endif
 
 #ifdef HAVE_WIIUSB_HID
-#include "../input/drivers_hid/wiiusb_hid.c"
+#include "../input/drivers_hid/wiiusb_hid_libogc.c"
+#endif
+
+#ifdef HAVE_GEKKO_HID
+#include "../input/drivers_hid/gekko_hid.c"
 #endif
 
 #include "../input/connect/joypad_connection.c"
@@ -1039,8 +1053,10 @@ AUDIO
 #include "../audio/drivers/ps3_audio.c"
 #elif defined(XENON)
 #include "../audio/drivers/xenon360_audio.c"
+#elif defined(GEKKO) && defined(HAVE_LIBOGC)
+#include "../audio/drivers/gx_audio_libogc.c"
 #elif defined(GEKKO)
-#include "../audio/drivers/gx_audio.c"
+#include "../audio/drivers/gekko_audio.c"
 #elif defined(__wiiu__)
 #include "../audio/drivers/wiiu_audio.c"
 #elif defined(HAVE_RWEBAUDIO)
@@ -1359,11 +1375,13 @@ FRONTEND
 #include "../frontend/drivers/platform_xdk.c"
 #endif
 
-#if defined(GEKKO)
-#include "../frontend/drivers/platform_gx.c"
+#if defined(GEKKO) && defined(HAVE_LIBOGC)
+#include "../frontend/drivers/platform_gx_libogc.c"
 #ifdef HW_RVL
-#include "../frontend/drivers/platform_wii.c"
+#include "../frontend/drivers/platform_wii_libogc.c"
 #endif
+#elif defined(GEKKO)
+#include "../frontend/drivers/platform_gekko.c"
 #elif defined(__wiiu__)
 #include "../frontend/drivers/platform_wiiu.c"
 #elif defined(PS2)
@@ -1425,7 +1443,7 @@ RETROARCH
 #include "../runahead.c"
 #endif
 #include "../command.c"
-#ifdef HAVE_NETWORK_CMD
+#if defined(HAVE_MCP) && defined(HAVE_NETWORK_CMD) && defined(HAVE_COMMAND)
 #include "../network/mcp_server.c"
 #endif
 #include "../ui/ui_companion_driver.c"
@@ -1612,6 +1630,8 @@ MENU
 #include "../menu/cbs/menu_cbs_cancel.c"
 #include "../menu/cbs/menu_cbs_select.c"
 #include "../menu/cbs/menu_cbs_start.c"
+#include "../menu/cbs/menu_cbs_drag.c"
+#include "../menu/cbs/menu_cbs_drop.c"
 #include "../menu/cbs/menu_cbs_info.c"
 #include "../menu/cbs/menu_cbs_left.c"
 #include "../menu/cbs/menu_cbs_right.c"

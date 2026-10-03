@@ -27,7 +27,7 @@ jobs:
 
     steps:
       - name: Install dependencies
-        timeout-minutes: 5
+        timeout-minutes: 20
         run: |
           pkgs="build-essential zlib1g-dev"
           if dpkg -s $pkgs >/dev/null 2>&1; then
@@ -39,6 +39,23 @@ jobs:
               -o Acquire::Retries=3 -o Acquire::http::Timeout=30 && break
             echo "apt-get update failed (attempt $i); retrying in 10s"
             sleep 10
+          done
+          # Fetch first, under a bound: a download is safe to stop and
+          # resumes, an install is not. A mirror that stalls is left for
+          # the main archive on the next attempt.
+          for i in 1 2 3; do
+            sudo timeout 240 apt-get install -y --download-only \
+              -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
+              $pkgs && break
+            [ $i = 3 ] && exit 1
+            echo "package download failed or stalled (attempt $i); retrying from archive.ubuntu.com"
+            for f in /etc/apt/sources.list /etc/apt/sources.list.d/*; do
+              [ -f "$f" ] || continue
+              sudo sed -i -e 's#mirror+file:/etc/apt/apt-mirrors.txt#http://archive.ubuntu.com/ubuntu/#g' \
+                -e 's#http://azure\.archive\.ubuntu\.com/ubuntu#http://archive.ubuntu.com/ubuntu#g' "$f"
+            done
+            sudo timeout 90 apt-get update -y \
+              -o Acquire::Retries=3 -o Acquire::http::Timeout=30 || true
           done
           sudo apt-get install -y \
             -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
@@ -102,7 +119,7 @@ jobs:
           fi
           echo "[pass] database_task no-args exit=$rc (expected non-zero)"
 
-      - name: Build and run archive_name_safety_test
+      - name: Build and run archive_name_safety_test, decompress_window_test (plain, ASan + UBSan, TSan)
         shell: bash
         working-directory: samples/tasks/decompress
         run: |
@@ -116,6 +133,31 @@ jobs:
           # ever amends the predicate, the copy here must follow.
           timeout 60 ./archive_name_safety_test
           echo "[pass] archive_name_safety_test"
+          # Oracle for the extraction task's pacing, compiled from the
+          # shipping translation unit against the real unthreaded
+          # task queue, ZIP backend and shared per-frame I/O window,
+          # with a virtual clock: a whole archive fits one window, an
+          # exhausted window still extracts one item per call.  A
+          # DEFLATE member larger than the backend's output window is
+          # written a window at a time, through a temporary file that
+          # a CRC failure or a cancel removes, leaving any previous
+          # file in place.
+          timeout 60 ./decompress_window_test
+          make clean >/dev/null
+          # The same lanes against the built-in inflater, which builds
+          # without HAVE_ZLIB use and which rebinds its output window
+          # differently from zlib.
+          make all BUILTIN_DEFLATE=1
+          timeout 60 ./decompress_window_test
+          make clean BUILTIN_DEFLATE=1 >/dev/null
+          make all SANITIZER=address,undefined -j$(nproc)
+          ASAN_OPTIONS=detect_leaks=1:detect_stack_use_after_return=1 \
+          UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+            timeout 120 ./decompress_window_test
+          make clean >/dev/null
+          make all SANITIZER=thread -j$(nproc)
+          TSAN_OPTIONS=halt_on_error=1 timeout 120 ./decompress_window_test
+          make clean >/dev/null
 
       - name: Build and run cloudsync_path_safety_test
         shell: bash
@@ -241,6 +283,28 @@ jobs:
           timeout 60 ./input_remap_bounds_test
           echo "[pass] input_remap_bounds_test"
 
+      - name: Build and run turbo_bind_bounds_test (ASan + UBSan)
+        shell: bash
+        working-directory: samples/tasks/turbo_bind
+        run: |
+          set -eu
+          # Turbo Bind and Turbo Button hold a RetroPad ID that indexes
+          # input_config_bind_order[24] in the menu's left/right
+          # handlers and input_remap_ids[port][] in the turbo paths of
+          # input_driver.c.  The test walks both settings in both
+          # directions with wrap-around on and off, feeds them values
+          # from outside their range, checks the load-time clamp in
+          # configuration.c and the empty-bind guard on the turbo
+          # clear, with the tables at their exact sizes so either
+          # sanitizer reports an index past an end.  If
+          # menu_setting.c, configuration.c or input_driver.c change
+          # those functions, the copies in turbo_bind_bounds_test.c
+          # must follow.
+          make clean all SANITIZER=address,undefined
+          test -x turbo_bind_bounds_test
+          UBSAN_OPTIONS=halt_on_error=1 timeout 60 ./turbo_bind_bounds_test
+          echo "[pass] turbo_bind_bounds_test"
+
       - name: Build and run bsv_replay_bounds_test (ASan)
         shell: bash
         working-directory: samples/tasks/bsv_replay
@@ -261,6 +325,24 @@ jobs:
           test -x bsv_replay_bounds_test
           timeout 60 ./bsv_replay_bounds_test
           echo "[pass] bsv_replay_bounds_test"
+
+      - name: Build and run bsv_checkpoint_bounds_test (ASan + UBSan)
+        shell: bash
+        working-directory: samples/tasks/bsv_checkpoint
+        run: |
+          set -eu
+          # A checkpoint in a .bsv replay carries its state, encoded
+          # and compressed sizes, all from the file.  The test feeds
+          # bsv_movie_load_checkpoint() checkpoints whose sizes
+          # disagree, truncated ones and skipped ones, with buffers at
+          # their exact sizes, so an overflow, a double free or a
+          # leak is reported.  If input/bsv/bsvmovie.c changes that
+          # function, the verbatim copy in
+          # bsv_checkpoint_bounds_test.c must follow.
+          make clean all SANITIZER=address,undefined
+          test -x bsv_checkpoint_bounds_test
+          UBSAN_OPTIONS=halt_on_error=1 timeout 60 ./bsv_checkpoint_bounds_test
+          echo "[pass] bsv_checkpoint_bounds_test"
 
       - name: Build and run bsv_replay_init_test (plain, ASan + UBSan)
         shell: bash
@@ -287,6 +369,41 @@ jobs:
           ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1 \
              timeout 120 ./bsv_replay_init_test
           echo "[pass] bsv_replay_init_test (ASan + UBSan)"
+
+      - name: Build and run bsv_statestream_test (plain, ASan + UBSan)
+        shell: bash
+        working-directory: samples/tasks/bsv_statestream
+        run: |
+          set -eu
+          # Statestream checkpoints decoded by the shipping
+          # input/bsv/bsvmovie.c with HAVE_STATESTREAM on, which no
+          # other lane builds.  Block and superblock indices, the
+          # superblock sequence and its length all come from the
+          # replay file: the test round-trips recorded checkpoints,
+          # then feeds sequences naming undefined superblocks and
+          # blocks, a sequence longer than the superblock list, a
+          # recording after a short sequence, and a header with no
+          # block layout.  The oom and oomload lanes fail each
+          # allocation of a checkpoint write and of a load in turn
+          # (malloc, calloc and realloc are wrapped at link time) and
+          # need every one to fail cleanly, with no leak.  Each lane
+          # takes its name as an argument to run alone.
+          make clean all
+          test -x bsv_statestream_test
+          timeout 120 ./bsv_statestream_test
+          echo "[pass] bsv_statestream_test"
+          make clean all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
+             timeout 120 ./bsv_statestream_test
+          echo "[pass] bsv_statestream_test (ASan + UBSan)"
+          # Again with every object hashing alike (constant_hash.h),
+          # so inserts share buckets and the oom lanes also fail the
+          # buckets' own growth.
+          make clean all SANITIZER=address,undefined \
+             EXTRA_CFLAGS='-include $(CURDIR)/constant_hash.h'
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
+             timeout 120 ./bsv_statestream_test
+          echo "[pass] bsv_statestream_test (colliding hash)"
 
       - name: Build and run bps_patch_bounds_test (ASan)
         shell: bash
@@ -483,6 +600,145 @@ jobs:
           make -f Makefile.refresh_flags clean
           echo "[pass] get_list_refresh_flags_test (TSan)"
 
+      - name: Build and run update_installed_scan_test (ASan + UBSan, TSan)
+        shell: bash
+        working-directory: samples/tasks/core_updater
+        run: |
+          set -eu
+          # Regression lane for the Update Installed Cores scan in
+          # tasks/task_core_updater.c, against the shipping task, list
+          # parser, HTTP task and task queue.  Every list entry and
+          # every CRC chunk is a work item of the shared per-frame I/O
+          # window (task_nbio_slice_*), so with the unthreaded queue a
+          # 512-entry list finishes in a few dozen frames rather than
+          # one frame per entry; a CRC resumed on a later tick does not
+          # repeat the per-core stats.  Both are asserted: the gather
+          # count, and path_is_valid() calls counted at the link
+          # boundary.  The get-list lane forces the window to its
+          # one-item floor and asserts the listing is parsed a line
+          # per gather into a private list, while the caller's list -
+          # read by the Core Downloader's menu callbacks every frame -
+          # only ever holds its old contents or the complete new ones.
+          # The scan lanes also count core info reads at the link
+          # boundary: Update Installed Cores' fetch reads info for its
+          # installed cores alone.  The status lanes pin that a fetch
+          # finding no installed cores still ends in 'all cores
+          # updated' and a failed fetch in 'core list failed'.
+          # The refused-download lane refuses a changed core's transfer
+          # and asserts the run still completes: a download that
+          # cannot start fails instead of waiting on an extraction.
+          # The CRC cache lane counts bytes hashed at the link
+          # boundary: a repeat run hashes no unchanged core, a touched
+          # core is hashed again, a changed one is hashed and
+          # downloaded, and a corrupt cache falls back to hashing all.
+          make -f Makefile.update_installed clean all
+          test -x update_installed_scan_test
+          timeout 600 ./update_installed_scan_test
+          echo "[pass] update_installed_scan_test"
+          make -f Makefile.update_installed clean all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1:detect_stack_use_after_return=1 \
+             UBSAN_OPTIONS=print_stacktrace=1 timeout 600 \
+             ./update_installed_scan_test
+          echo "[pass] update_installed_scan_test (ASan)"
+          make -f Makefile.update_installed clean all SANITIZER=thread
+          TSAN_OPTIONS=halt_on_error=1 timeout 600 \
+             ./update_installed_scan_test
+          make -f Makefile.update_installed clean
+          echo "[pass] update_installed_scan_test (TSan)"
+
+      - name: Build and run staged_install_test (ASan + UBSan, TSan)
+        shell: bash
+        working-directory: samples/tasks/core_updater
+        run: |
+          set -eu
+          # End-to-end lane for the staged core install against the
+          # shipping updater, HTTP, decompress, archive, rzip and core
+          # backup code, serving real deflated zips: with 'Compress
+          # Automatic Core Backups' off the replaced core is moved into
+          # the backups as it is; the history is pruned; a move refused
+          # at the link boundary falls back to a compressed copy; with
+          # the setting on the backup is compressed as before; a new
+          # core that cannot be moved into place leaves the installed
+          # one as it was.
+          make -f Makefile.staged_install clean all
+          timeout 600 ./staged_install_test
+          echo "[pass] staged_install_test"
+          make -f Makefile.staged_install clean all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1:detect_stack_use_after_return=1 \
+             UBSAN_OPTIONS=print_stacktrace=1 timeout 600 \
+             ./staged_install_test
+          echo "[pass] staged_install_test (ASan)"
+          make -f Makefile.staged_install clean all SANITIZER=thread
+          TSAN_OPTIONS=halt_on_error=1 timeout 600 \
+             ./staged_install_test
+          make -f Makefile.staged_install clean
+          echo "[pass] staged_install_test (TSan)"
+
+      - name: Build and run download_backup_wait_test (ASan + UBSan, TSan)
+        shell: bash
+        working-directory: samples/tasks/core_updater
+        run: |
+          set -eu
+          # Regression lane for the core download task's wait on its
+          # automatic backup in tasks/task_core_updater.c.  The threaded
+          # queue frees a retired backup task on the main thread while
+          # the download handler runs on the worker, so completion has
+          # to come from the backup's callback rather than from reading
+          # the task.  One lane retires and frees the backup between two
+          # download ticks (a handler that reads it is a
+          # heap-use-after-free under ASan); the other cancels the
+          # download while the backup runs, so the backup's callback
+          # fires after the download's handle is gone.
+          make -f Makefile.download_backup clean all
+          test -x download_backup_wait_test
+          timeout 600 ./download_backup_wait_test
+          echo "[pass] download_backup_wait_test"
+          make -f Makefile.download_backup clean all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1:detect_stack_use_after_return=1 \
+             UBSAN_OPTIONS=print_stacktrace=1 timeout 600 \
+             ./download_backup_wait_test
+          echo "[pass] download_backup_wait_test (ASan)"
+          make -f Makefile.download_backup clean all SANITIZER=thread
+          TSAN_OPTIONS=halt_on_error=1 timeout 600 \
+             ./download_backup_wait_test
+          make -f Makefile.download_backup clean
+          echo "[pass] download_backup_wait_test (TSan)"
+
+      - name: Build and run pfd_switch_cores_test (ASan + UBSan, TSan)
+        shell: bash
+        working-directory: samples/tasks/core_updater
+        run: |
+          set -eu
+          # Regression lane for the Play Feature Delivery 'switch
+          # installed cores' task in tasks/task_core_updater.c, built
+          # with ANDROID defined against stand-ins for the five
+          # play_feature_delivery_* calls.  The switch task learns of
+          # each install's completion and error from the install's
+          # callback rather than by reading the task, which the queue
+          # frees as it retires it; with the threaded queue, a wait
+          # that reads the task moves on before the install is retired
+          # and the next push is refused, skipping cores.  The other
+          # lanes end the switch on a failed install, and cancel the
+          # switch while an install runs.  The recovery lanes leave
+          # the <core>.bak an interrupted install moves the core to,
+          # with the core missing: the next install must put it back
+          # if it fails and drop it if it succeeds or play feature
+          # delivery already installed the core.
+          make -f Makefile.pfd_switch clean all
+          test -x pfd_switch_cores_test
+          timeout 600 ./pfd_switch_cores_test
+          echo "[pass] pfd_switch_cores_test"
+          make -f Makefile.pfd_switch clean all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1:detect_stack_use_after_return=1 \
+             UBSAN_OPTIONS=print_stacktrace=1 timeout 600 \
+             ./pfd_switch_cores_test
+          echo "[pass] pfd_switch_cores_test (ASan)"
+          make -f Makefile.pfd_switch clean all SANITIZER=thread
+          TSAN_OPTIONS=halt_on_error=1 timeout 600 \
+             ./pfd_switch_cores_test
+          make -f Makefile.pfd_switch clean
+          echo "[pass] pfd_switch_cores_test (TSan)"
+
       - name: Build and run core_backup_io_test (ASan + UBSan, TSan)
         shell: bash
         working-directory: samples/tasks/core_backup
@@ -534,6 +790,15 @@ jobs:
           # while the suite reported PASSED.  Both refusal paths are
           # now CHECK failures: a fixture this test builds itself
           # cannot legitimately be unavailable to it.
+          #
+          # The interrupted-restore lanes stop a restore one quantum
+          # in, by cancelling it (as the exit drain does) and by
+          # failing its writes (a full disk), and require the
+          # installed core to be byte-identical afterwards with no
+          # temporary left: the restore writes beside the core and
+          # renames over it only once complete.  The symlink lane
+          # requires a core reached through a link to keep the link
+          # and have its target replaced.
           make clean all
           test -x core_backup_io_test
           timeout 600 ./core_backup_io_test
@@ -1305,7 +1570,7 @@ jobs:
 
     steps:
       - name: Install dependencies
-        timeout-minutes: 5
+        timeout-minutes: 20
         run: |
           pkgs="build-essential zlib1g-dev"
           if dpkg -s $pkgs >/dev/null 2>&1; then
@@ -1317,6 +1582,23 @@ jobs:
               -o Acquire::Retries=3 -o Acquire::http::Timeout=30 && break
             echo "apt-get update failed (attempt $i); retrying in 10s"
             sleep 10
+          done
+          # Fetch first, under a bound: a download is safe to stop and
+          # resumes, an install is not. A mirror that stalls is left for
+          # the main archive on the next attempt.
+          for i in 1 2 3; do
+            sudo timeout 240 apt-get install -y --download-only \
+              -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
+              $pkgs && break
+            [ $i = 3 ] && exit 1
+            echo "package download failed or stalled (attempt $i); retrying from archive.ubuntu.com"
+            for f in /etc/apt/sources.list /etc/apt/sources.list.d/*; do
+              [ -f "$f" ] || continue
+              sudo sed -i -e 's#mirror+file:/etc/apt/apt-mirrors.txt#http://archive.ubuntu.com/ubuntu/#g' \
+                -e 's#http://azure\.archive\.ubuntu\.com/ubuntu#http://archive.ubuntu.com/ubuntu#g' "$f"
+            done
+            sudo timeout 90 apt-get update -y \
+              -o Acquire::Retries=3 -o Acquire::http::Timeout=30 || true
           done
           sudo apt-get install -y \
             -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
@@ -1437,8 +1719,9 @@ jobs:
           # sits between two representations: RetroArch's raw
           # CRLF-delimited blob and the NULL-terminated key/value array
           # emscripten_fetch wants, plus the response blob that has to
-          # become the same "Name: Value" string_list net_http.c
-          # produces.  Neither conversion existed while the backend was
+          # become the same "Name: Value" header block net_http.c
+          # produces - through net_http_headers_compact(), which the test
+          # links rather than copies.  Neither conversion existed while the backend was
           # on emscripten_async_wget2_data, which has no header support
           # at all - the `headers` argument was accepted and dropped on
           # every entry point, so cloud sync could not authenticate.
@@ -1613,6 +1896,30 @@ jobs:
           make -f Makefile.transport_fail clean
           echo "[pass] http_transport_failure_test (TSan)"
 
+      - name: Build and run http_resume_test (ASan + UBSan, TSan)
+        shell: bash
+        working-directory: samples/tasks/http
+        run: |
+          set -eu
+          # An interrupted download to a file (task_push_http_download_file,
+          # as the core updater and thumbnails use) resumes with
+          # "Range: bytes=N-" and If-Range on the first response's strong
+          # ETag. A 206 from the right offset continues the file; a 200
+          # (resource changed) starts it over; a 206 from the wrong offset,
+          # a first response without Accept-Ranges or a validator, and a
+          # connection that keeps dropping (more than three resumes) fail
+          # and remove the partial file. Every interrupted download used
+          # to fail outright.
+          make -f Makefile.resume clean all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1:detect_stack_use_after_return=1 \
+             UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 timeout 300 \
+             ./http_resume_test
+          echo "[pass] http_resume_test (ASan)"
+          make -f Makefile.resume clean all SANITIZER=thread
+          TSAN_OPTIONS=halt_on_error=1 timeout 300 ./http_resume_test
+          make -f Makefile.resume clean
+          echo "[pass] http_resume_test (TSan)"
+
       - name: Build and run HTTP initialization failure test
         shell: bash
         working-directory: samples/tasks/http
@@ -1624,6 +1931,30 @@ jobs:
             timeout 60 ./http_init_failure_test
           done
           make -f Makefile.init_failure clean
+
+      - name: Build and run http_limits_test (ASan + UBSan, threaded and not)
+        shell: bash
+        working-directory: samples/tasks/http
+        run: |
+          set -eu
+          # net_http.c included whole, with the clock and the socket
+          # calls stubbed. The DNS cache is capped (it grew by one entry
+          # per distinct host:port for the whole session), evicts least
+          # recently used first, and never evicts a lookup still in
+          # flight. The pool keeps at most 8 idle connections, closing
+          # the longest-idle first, and closes rather than reuses one
+          # idle for more than 30 s. On a system without IPv6, an IPv6
+          # address listed first no longer fails the transfer, and one
+          # mid-list no longer hides the addresses after it. Bracketed
+          # IPv6 literals ([::1]:8080) parse in URLs and redirects and
+          # reach the resolver without their brackets.
+          for threads in 1 0; do
+            make -f Makefile.limits clean
+            make -f Makefile.limits THREADS=$threads SANITIZER=address,undefined
+            ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 \
+               timeout 60 ./http_limits_test
+          done
+          make -f Makefile.limits clean
 
       - name: Build and run HTTP DNS connect lifetime test
         shell: bash

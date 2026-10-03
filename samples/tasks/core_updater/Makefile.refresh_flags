@@ -16,6 +16,7 @@ SOURCES := \
 	get_list_refresh_flags_test.c \
 	stubs_retroarch.c \
 	$(CORE_DIR)/tasks/task_core_updater.c \
+	$(CORE_DIR)/tasks/task_nbio_slice.c \
 	$(CORE_DIR)/core_updater_list.c \
 	$(CORE_DIR)/tasks/task_http.c \
 	$(LIBRETRO_COMM_DIR)/queues/task_queue.c \
@@ -42,6 +43,7 @@ SOURCES := \
 	$(LIBRETRO_COMM_DIR)/encodings/encoding_utf.c \
 	$(LIBRETRO_COMM_DIR)/features/features_cpu.c \
 	$(LIBRETRO_COMM_DIR)/rthreads/rthreads.c \
+	$(LIBRETRO_COMM_DIR)/rthreads/retro_eventcount.c \
 	$(LIBRETRO_COMM_DIR)/time/rtime.c
 
 OBJS := $(SOURCES:.c=.o)

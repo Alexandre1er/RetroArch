@@ -27,7 +27,7 @@ jobs:
 
     steps:
       - name: Install dependencies
-        timeout-minutes: 5
+        timeout-minutes: 20
         run: |
           # All three packages ship on the stock ubuntu-latest image, so
           # this step is a no-op there and apt is only contacted if the
@@ -44,6 +44,23 @@ jobs:
               -o Acquire::Retries=3 -o Acquire::http::Timeout=30 && break
             echo "apt-get update failed (attempt $i); retrying in 10s"
             sleep 10
+          done
+          # Fetch first, under a bound: a download is safe to stop and
+          # resumes, an install is not. A mirror that stalls is left for
+          # the main archive on the next attempt.
+          for i in 1 2 3; do
+            sudo timeout 240 apt-get install -y --download-only \
+              -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
+              build-essential zlib1g-dev clang ffmpeg && break
+            [ $i = 3 ] && exit 1
+            echo "package download failed or stalled (attempt $i); retrying from archive.ubuntu.com"
+            for f in /etc/apt/sources.list /etc/apt/sources.list.d/*; do
+              [ -f "$f" ] || continue
+              sudo sed -i -e 's#mirror+file:/etc/apt/apt-mirrors.txt#http://archive.ubuntu.com/ubuntu/#g' \
+                -e 's#http://azure\.archive\.ubuntu\.com/ubuntu#http://archive.ubuntu.com/ubuntu#g' "$f"
+            done
+            sudo timeout 90 apt-get update -y \
+              -o Acquire::Retries=3 -o Acquire::http::Timeout=30 || true
           done
           sudo apt-get install -y \
             -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
@@ -98,13 +115,14 @@ jobs:
             snprintf
             unbase64_test
             crc32_test
+            rinflate_window_test
             emscripten_mmap_test
             archive_zip_test
             archive_zstd_test
             config_file_test
             path_resolve_realpath_test
             fill_pathname_test
-            nbio_test
+            path_mkdir_test
             rpng
             rzip_chunk_size_test
             rzip_matches_buf_test
@@ -130,6 +148,7 @@ jobs:
             vfs_v5_metadata_test
             vfs_hybrid_test
             filestream_rbuf_fault_test
+            vfs_rename_replace_test
             cdrom_cuesheet_overflow_test
             cdfs_dir_record_test
             cdfs_pure_api_test
@@ -178,12 +197,18 @@ jobs:
             retro_atomic_ps2_backend_test
             retro_spsc_test
             mpsc_stack_test
+            # A frame handoff where neither side waits: no read sees a
+            # buffer being filled, the reader ends on the last frame.
+            retro_triple_buffer_test
             retro_waitable_spsc_test
             retro_eventcount_test
             # retro_sleep_until_us must never return early against the
             # microsecond clock; the late bound is loose for a loaded
             # runner.
             retro_sleep_until_test
+            # localtime() from four threads, before rtime_init() as
+            # well as after: each must get its own fields back.
+            rtime_localtime_test
             # Runs its natural tier only here; procbarrier-tiers.yml
             # forces every tier on Linux, Windows and macOS runners.
             retro_procbarrier_test
@@ -197,6 +222,10 @@ jobs:
             memshm_area_test
             msg_fifo_queue_test
             audio_mixer_loop_test
+            # Voice volume and gain set and read from two threads while
+            # a third mixes: every read and every block one of the
+            # values set.
+            audio_mixer_voice_threads_test
             audio_mixer_rate_guard_test
             # The AC-3 / E-AC-3 frame layer against ffmpeg's streams:
             # ffmpeg is in the package list above for it.
@@ -499,6 +528,51 @@ jobs:
 
           TSAN_OPTIONS=halt_on_error=1 ./retro_atomic_test
 
+      - name: Run rtime_localtime_test under Clang + ThreadSanitizer
+        shell: bash
+        working-directory: libretro-common/samples/time/rtime_localtime_test
+        run: |
+          # rtime_localtime() guards the one struct localtime() fills;
+          # two callers let in together race on it, which TSan reports
+          # even on runs where neither hands back the other's fields.
+          set -u
+          set -o pipefail
+
+          make clean
+          CC=clang make all SANITIZER=thread
+
+          TSAN_OPTIONS=halt_on_error=1 ./rtime_localtime_test
+
+      - name: Run retro_triple_buffer_test under Clang + ThreadSanitizer
+        shell: bash
+        working-directory: libretro-common/samples/queues/retro_triple_buffer_test
+        run: |
+          # The HUB75 driver's canvases and the ffmpeg camera's frames:
+          # a buffer handed over with one exchange and picked up with
+          # another, so a missing barrier is a race only TSan reports.
+          set -u
+          set -o pipefail
+
+          make clean
+          CC=clang make all SANITIZER=thread
+
+          TSAN_OPTIONS=halt_on_error=1 ./retro_triple_buffer_test
+
+      - name: Run audio_mixer_voice_threads_test under Clang + ThreadSanitizer
+        shell: bash
+        working-directory: libretro-common/samples/audio/audio_mixer_voice_threads
+        run: |
+          # A voice's volume and gain are atomics the caller sets and
+          # reads with no lock while the audio thread mixes the voice;
+          # TSan reports any field the three threads share unordered.
+          set -u
+          set -o pipefail
+
+          make clean
+          CC=clang make all SANITIZER=thread
+
+          TSAN_OPTIONS=halt_on_error=1 ./audio_mixer_voice_threads_test
+
       - name: Run mpsc_stack_test under Clang + ThreadSanitizer
         shell: bash
         working-directory: libretro-common/samples/queues/mpsc_stack_test
@@ -727,7 +801,7 @@ jobs:
 
     steps:
       - name: Install dependencies
-        timeout-minutes: 5
+        timeout-minutes: 20
         run: |
           # clang ships on the stock ubuntu-latest image; apt is only
           # contacted if the image ever drops it.
@@ -740,6 +814,23 @@ jobs:
               -o Acquire::Retries=3 -o Acquire::http::Timeout=30 && break
             echo "apt-get update failed (attempt $i); retrying in 10s"
             sleep 10
+          done
+          # Fetch first, under a bound: a download is safe to stop and
+          # resumes, an install is not. A mirror that stalls is left for
+          # the main archive on the next attempt.
+          for i in 1 2 3; do
+            sudo timeout 240 apt-get install -y --download-only \
+              -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
+              clang && break
+            [ $i = 3 ] && exit 1
+            echo "package download failed or stalled (attempt $i); retrying from archive.ubuntu.com"
+            for f in /etc/apt/sources.list /etc/apt/sources.list.d/*; do
+              [ -f "$f" ] || continue
+              sudo sed -i -e 's#mirror+file:/etc/apt/apt-mirrors.txt#http://archive.ubuntu.com/ubuntu/#g' \
+                -e 's#http://azure\.archive\.ubuntu\.com/ubuntu#http://archive.ubuntu.com/ubuntu#g' "$f"
+            done
+            sudo timeout 90 apt-get update -y \
+              -o Acquire::Retries=3 -o Acquire::http::Timeout=30 || true
           done
           sudo apt-get install -y \
             -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
@@ -830,13 +921,30 @@ jobs:
 
     steps:
       - name: Install dependencies
-        timeout-minutes: 5
+        timeout-minutes: 20
         run: |
           for i in 1 2 3; do
             sudo timeout 90 apt-get update -y \
               -o Acquire::Retries=3 -o Acquire::http::Timeout=30 && break
             echo "apt-get update failed (attempt $i); retrying in 10s"
             sleep 10
+          done
+          # Fetch first, under a bound: a download is safe to stop and
+          # resumes, an install is not. A mirror that stalls is left for
+          # the main archive on the next attempt.
+          for i in 1 2 3; do
+            sudo timeout 240 apt-get install -y --download-only \
+              -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
+              build-essential ${{ matrix.apt_pkgs }} qemu-user-static && break
+            [ $i = 3 ] && exit 1
+            echo "package download failed or stalled (attempt $i); retrying from archive.ubuntu.com"
+            for f in /etc/apt/sources.list /etc/apt/sources.list.d/*; do
+              [ -f "$f" ] || continue
+              sudo sed -i -e 's#mirror+file:/etc/apt/apt-mirrors.txt#http://archive.ubuntu.com/ubuntu/#g' \
+                -e 's#http://azure\.archive\.ubuntu\.com/ubuntu#http://archive.ubuntu.com/ubuntu#g' "$f"
+            done
+            sudo timeout 90 apt-get update -y \
+              -o Acquire::Retries=3 -o Acquire::http::Timeout=30 || true
           done
           sudo apt-get install -y \
             -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
@@ -965,13 +1073,30 @@ jobs:
 
     steps:
       - name: Install dependencies
-        timeout-minutes: 5
+        timeout-minutes: 20
         run: |
           for i in 1 2 3; do
             sudo timeout 90 apt-get update -y \
               -o Acquire::Retries=3 -o Acquire::http::Timeout=30 && break
             echo "apt-get update failed (attempt $i); retrying in 10s"
             sleep 10
+          done
+          # Fetch first, under a bound: a download is safe to stop and
+          # resumes, an install is not. A mirror that stalls is left for
+          # the main archive on the next attempt.
+          for i in 1 2 3; do
+            sudo timeout 240 apt-get install -y --download-only \
+              -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
+              build-essential ${{ matrix.apt_pkgs }} qemu-user-static && break
+            [ $i = 3 ] && exit 1
+            echo "package download failed or stalled (attempt $i); retrying from archive.ubuntu.com"
+            for f in /etc/apt/sources.list /etc/apt/sources.list.d/*; do
+              [ -f "$f" ] || continue
+              sudo sed -i -e 's#mirror+file:/etc/apt/apt-mirrors.txt#http://archive.ubuntu.com/ubuntu/#g' \
+                -e 's#http://azure\.archive\.ubuntu\.com/ubuntu#http://archive.ubuntu.com/ubuntu#g' "$f"
+            done
+            sudo timeout 90 apt-get update -y \
+              -o Acquire::Retries=3 -o Acquire::http::Timeout=30 || true
           done
           sudo apt-get install -y \
             -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \

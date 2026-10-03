@@ -5300,7 +5300,14 @@ static void cb_decompressed(retro_task_t *task,
       switch (enum_idx)
       {
          case MENU_ENUM_LABEL_CB_UPDATE_ASSETS:
-            generic_action_ok_command(CMD_EVENT_REINIT);
+            /* The menu reads its icons and fonts from the assets
+             * directory when its context is built, so the new ones
+             * only need that context rebuilt against the running
+             * video driver. */
+            menu_driver_context_rebuild();
+#ifdef HAVE_GFX_WIDGETS
+            gfx_widgets_reload_assets();
+#endif
             break;
          case MENU_ENUM_LABEL_CB_UPDATE_AUTOCONFIG_PROFILES:
             {
@@ -7606,14 +7613,38 @@ static int generic_action_ok_dropdown_setting(const char *path, const char *labe
 
    switch (setting->type)
    {
+      /* Integer lists are built from the minimum (0 unless the range
+       * enforces one) in whole steps, so entry @idx is that value;
+       * the value is taken back the same way, not from offset_by,
+       * which only some settings set to their minimum. */
       case ST_INT:
-         setting_int_set(setting,
-               (int)((idx * setting->step) + setting->offset_by));
+         {
+            int32_t i_min  = (setting->flags & SD_FLAG_ENFORCE_MINRANGE)
+               ? (int32_t)setting->min : 0;
+            int32_t i_step = (int32_t)setting->step;
+            int32_t value;
+            if (i_step < 1)
+               i_step = 1;
+            value = i_min + (int32_t)idx * i_step;
+            if (     (setting->flags & SD_FLAG_ENFORCE_MAXRANGE)
+                  && value > (int32_t)setting->max)
+               value = (int32_t)setting->max;
+            setting_int_set(setting, value);
+         }
          break;
       case ST_UINT:
          {
-            unsigned value = (unsigned)((idx * setting->step) + setting->offset_by);
-            setting_uint_set(setting, value);
+            int32_t i_min  = (setting->flags & SD_FLAG_ENFORCE_MINRANGE)
+               ? (int32_t)setting->min : 0;
+            int32_t i_step = (int32_t)setting->step;
+            int32_t value;
+            if (i_step < 1)
+               i_step = 1;
+            value = i_min + (int32_t)idx * i_step;
+            if (     (setting->flags & SD_FLAG_ENFORCE_MAXRANGE)
+                  && value > (int32_t)setting->max)
+               value = (int32_t)setting->max;
+            setting_uint_set(setting, (unsigned)value);
          }
          break;
       case ST_FLOAT:
@@ -8484,8 +8515,6 @@ static int action_ok_state_slot_run(const char *path,
    return 0;
 }
 
-static int action_ok_load_archive_detect_core(const char *path,
-      const char *label, unsigned type, size_t idx, size_t entry_idx);
 
 static int action_ok_load_archive(const char *path,
       const char *label, unsigned type, size_t idx, size_t entry_idx)
@@ -8519,7 +8548,7 @@ static int action_ok_load_archive(const char *path,
          CORE_TYPE_PLAIN);
 }
 
-static int action_ok_load_archive_detect_core(const char *path,
+int action_ok_load_archive_detect_core(const char *path,
       const char *label, unsigned type, size_t idx, size_t entry_idx)
 {
    char new_core_path[PATH_MAX_LENGTH];
@@ -8982,7 +9011,8 @@ static int action_ok_core_create_backup(const char *path,
    if (!core_path || !*core_path)
       return -1;
    task_push_core_backup(core_path, NULL, 0, CORE_BACKUP_MODE_MANUAL,
-         (size_t)auto_backup_history_size, dir_core_assets, false);
+         (size_t)auto_backup_history_size, dir_core_assets, false,
+         NULL, NULL);
    return 0;
 }
 
@@ -9783,6 +9813,7 @@ static int menu_cbs_init_bind_ok_compare_label(menu_file_list_cbs_t *cbs,
          {MENU_ENUM_LABEL_SYSTEM_INFORMATION,                  action_ok_push_default},
          {MENU_ENUM_LABEL_DISPLAY_INFORMATION,                 action_ok_push_default},
          {MENU_ENUM_LABEL_DISPLAY_EDID_INFORMATION,            action_ok_push_default},
+         {MENU_ENUM_LABEL_INPUT_INFORMATION,                   action_ok_push_default},
          {MENU_ENUM_LABEL_NETWORK_INFORMATION,                 action_ok_push_default},
          {MENU_ENUM_LABEL_ACHIEVEMENT_LIST,                    action_ok_push_default},
          {MENU_ENUM_LABEL_DISK_OPTIONS,                        action_ok_push_default},
@@ -9794,7 +9825,6 @@ static int menu_cbs_init_bind_ok_compare_label(menu_file_list_cbs_t *cbs,
          {MENU_ENUM_LABEL_LOAD_CONTENT_LIST,                   action_ok_push_default},
          {MENU_ENUM_LABEL_ADD_CONTENT_LIST,                    action_ok_push_default},
          {MENU_ENUM_LABEL_CONFIGURATIONS_LIST,                 action_ok_push_default},
-         {MENU_ENUM_LABEL_HELP_LIST,                           action_ok_push_default},
          {MENU_ENUM_LABEL_INFORMATION_LIST,                    action_ok_push_default},
          {MENU_ENUM_LABEL_INFORMATION,                         action_ok_push_default},
          {MENU_ENUM_LABEL_CONTENT_SETTINGS,                    action_ok_push_default},

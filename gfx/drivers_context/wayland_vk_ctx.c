@@ -17,7 +17,7 @@
 #include <unistd.h>
 
 #ifdef HAVE_WAYLAND_BACKPORT
-#include "../../gfx/common/wayland_client_backport.h"
+#include "../../gfx/common/wayland_common_backport.h"
 #endif
 
 #include <wayland-client.h>
@@ -30,6 +30,7 @@
 #endif
 
 #include "../common/wayland_common.h"
+#include "../common/wayland_resize.h"
 #include "../../frontend/frontend_driver.h"
 #include "../../input/common/wayland_common.h"
 #include "../../input/input_driver.h"
@@ -50,7 +51,6 @@ static void gfx_ctx_wl_destroy_resources(gfx_ctx_wayland_data_t *wl)
    if (!wl)
       return;
    vulkan_context_destroy(&wl->vk, wl->surface);
-   gfx_ctx_wl_destroy_resources_common(wl);
 }
 
 static void gfx_ctx_wl_check_window(void *data, bool *quit,
@@ -73,12 +73,11 @@ static bool gfx_ctx_wl_set_resize(void *data, unsigned dims)
 
    wl->last_buffer_scale = wl->buffer_scale;
    wl->last_fractional_scale_num = wl->fractional_scale_num;
-   if (!wl->fractional_scale)
-      wl_surface_set_buffer_scale(wl->surface, wl->buffer_scale);
 
    if (vulkan_create_swapchain(&wl->vk, dims, wl->swap_interval))
    {
-      wl->ignore_configuration = false;
+      wl_surface_resized(wl->surface, wl->fractional_scale != NULL,
+            wl->buffer_scale, &wl->ignore_configuration);
       if (wl->vk.flags & VK_DATA_FLAG_CREATED_NEW_SWAPCHAIN)
       {
          wl->vk.context.flags |= VK_CTX_FLAG_INVALID_SWAPCHAIN;
@@ -109,9 +108,7 @@ static void *gfx_ctx_wl_init(void *data)
 
 error:
    gfx_ctx_wl_destroy_resources(wl);
-
-   if (wl)
-      free(wl);
+   gfx_ctx_wl_free_common(wl, false);
 
    return NULL;
 }
@@ -130,7 +127,7 @@ static void gfx_ctx_wl_destroy(void *data)
       slock_free(wl->vk.context.queue_lock);
 #endif
 
-   free(wl);
+   gfx_ctx_wl_free_common(wl, true);
 }
 
 static void gfx_ctx_wl_set_swap_interval(void *data, int swap_interval)
@@ -257,8 +254,8 @@ static void gfx_ctx_wl_swap_buffers(void *data)
 {
    gfx_ctx_wayland_data_t *wl = (gfx_ctx_wayland_data_t*)data;
 
-   if (wl->present_clock)
-      wl_presentation_dispatch_pending(wl);
+   if (wl->present.clock)
+      wl_present_dispatch(&wl->present, wl->input.dpy);
 
    /* While the compositor reports the surface suspended (occluded,
     * minimized, screen locked), skip presentation-time pacing,
@@ -286,8 +283,8 @@ static void gfx_ctx_wl_swap_buffers(void *data)
     * manual clock_nanosleep here would stack a second wait on top of
     * it.  Collect presentation feedback for timing data, but leave
     * pacing to the swapchain. */
-   if (wl->present_clock)
-      wl_request_presentation_feedback(wl);
+   if (wl->present.clock)
+      wl_present_request(&wl->present, wl->surface);
 
    if (wl->vk.context.flags & VK_CTX_FLAG_HAS_ACQUIRED_SWAPCHAIN)
    {

@@ -325,6 +325,7 @@ OBJ += \
        audio/audio_pipeline_stretch.o \
        audio/audio_binaural.o \
        input/input_driver.o \
+       input/input_driver_choice.o \
        input/input_overlay_textures.o \
        input/input_overlay_alpha.o \
        input/common/input_hid_common.o \
@@ -632,6 +633,14 @@ endif
 
 ifeq ($(HAVE_COMMAND), 1)
    DEFINES += -DHAVE_COMMAND
+   # The MCP server: desktop builds, through ./configure; no console
+   # Makefile sets HAVE_MCP.
+   ifeq ($(HAVE_NETWORKING), 1)
+      ifeq ($(HAVE_MCP), 1)
+         DEFINES += -DHAVE_MCP
+         OBJ     += network/mcp_server.o
+      endif
+   endif
 endif
 
 ifeq ($(HAVE_STDIN_CMD), 1)
@@ -1025,6 +1034,8 @@ ifeq ($(HAVE_MENU_COMMON), 1)
           menu/cbs/menu_cbs_cancel.o \
           menu/cbs/menu_cbs_select.o \
           menu/cbs/menu_cbs_start.o \
+          menu/cbs/menu_cbs_drag.o \
+          menu/cbs/menu_cbs_drop.o \
           menu/cbs/menu_cbs_info.o \
           menu/cbs/menu_cbs_left.o \
           menu/cbs/menu_cbs_right.o \
@@ -1212,6 +1223,7 @@ ifeq ($(HAVE_WAYLAND), 1)
         gfx/common/wayland/tearing-control-v1.o \
         gfx/common/wayland/color-management-v1.o \
         gfx/common/wayland_color.o \
+        gfx/common/wayland_present.o \
         gfx/common/wayland/kde-output-device-v2.o \
         gfx/common/wayland/kde-output-management-v2.o \
         gfx/common/wayland_kwin_output.o \
@@ -2493,7 +2505,6 @@ ifeq ($(HAVE_NETWORKING), 1)
    # Netplay
    DEFINES += -DHAVE_NETWORK_CMD
    OBJ += \
-	  network/mcp_server.o \
 	  network/netplay/netplay_frontend.o \
 	  network/netplay/netplay_room_parse.o
 

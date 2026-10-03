@@ -29,6 +29,7 @@
 #include "../gfx/video_driver.h"
 #include "../../frontend/frontend_driver.h"
 #include "../../verbosity.h"
+#include "../../runloop.h"
 
 #include "dbus_common.h"
 
@@ -39,10 +40,6 @@
 
 #ifdef HAVE_LIBDECOR_H
 #include <libdecor.h>
-#endif
-
-#ifndef CLOCK_MONOTONIC_RAW
-#define CLOCK_MONOTONIC_RAW 4
 #endif
 
 #define DEFAULT_WINDOWED_WIDTH 640
@@ -268,7 +265,16 @@ static void libdecor_frame_handle_configure(struct libdecor_frame *frame,
 {
    gfx_ctx_wayland_data_t *wl = (gfx_ctx_wayland_data_t*)data;
    if (wl->ignore_configuration)
+   {
+      /* Committing the configuration is what acknowledges it; an
+       * unacknowledged one leaves the frame's state stale and the
+       * compositor waiting. Keep the current size. */
+      struct libdecor_state *state = wl->libdecor_state_new(
+            VIDEO_SCALE_W(wl->dims), VIDEO_SCALE_H(wl->dims));
+      wl->libdecor_frame_commit(frame, state, configuration);
+      wl->libdecor_state_free(state);
       return;
+   }
    libdecor_frame_handle_configure_common(frame, configuration, wl);
    if (wl->driver_configure_handler)
       wl->driver_configure_handler(wl);
@@ -448,11 +454,15 @@ void gfx_ctx_wl_destroy_resources_common(gfx_ctx_wayland_data_t *wl)
 #endif
 
    if (wl->wl_keyboard)
-      wl_keyboard_destroy(wl->wl_keyboard);
+      wayland_keyboard_release(wl->wl_keyboard);
+   /* (this was never destroyed; it went with the connection) */
+   if (wl->wl_relative_pointer)
+      zwp_relative_pointer_v1_destroy(wl->wl_relative_pointer);
+   wl->wl_relative_pointer = NULL;
    if (wl->wl_pointer)
-      wl_pointer_destroy(wl->wl_pointer);
+      wayland_pointer_release(wl->wl_pointer);
    if (wl->wl_touch)
-      wl_touch_destroy(wl->wl_touch);
+      wayland_touch_release(wl->wl_touch);
 
    if (wl->cursor.surface)
       wl_surface_destroy(wl->cursor.surface);
@@ -520,9 +530,18 @@ void gfx_ctx_wl_destroy_resources_common(gfx_ctx_wayland_data_t *wl)
    if (wl->single_pixel_manager)
       wp_single_pixel_buffer_manager_v1_destroy (wl->single_pixel_manager);
    if (wl->seat)
-      wl_seat_destroy(wl->seat);
+      wayland_seat_release(wl->seat);
    if (wl->xdg_shell)
       xdg_wm_base_destroy(wl->xdg_shell);
+   if (wl->data_device)
+   {
+      if (wl_data_device_get_version(wl->data_device)
+            >= WL_DATA_DEVICE_RELEASE_SINCE_VERSION)
+         wl_data_device_release(wl->data_device);
+      else
+         wl_data_device_destroy(wl->data_device);
+      wl->data_device = NULL;
+   }
    if (wl->data_device_manager)
       wl_data_device_manager_destroy (wl->data_device_manager);
    while (!wl_list_empty(&wl->current_outputs))
@@ -535,8 +554,10 @@ void gfx_ctx_wl_destroy_resources_common(gfx_ctx_wayland_data_t *wl)
    {
       display_output_t *od = wl_container_of(wl->all_outputs.next, od, link);
       output_info_t    *oi = od->output;
-      wl_output_destroy(oi->output);
+      wayland_output_release(oi->output);
       wl_list_remove(&od->link);
+      free(oi->make);
+      free(oi->model);
       free(oi);
       free(od);
    }
@@ -546,15 +567,25 @@ void gfx_ctx_wl_destroy_resources_common(gfx_ctx_wayland_data_t *wl)
       wp_viewporter_destroy(wl->viewporter);
    if (wl->fractional_scale_manager)
       wp_fractional_scale_manager_v1_destroy(wl->fractional_scale_manager);
-   if (wl->presentation)
-   {
-      wl_presentation_destroy_feedbacks(wl);
-      wp_presentation_destroy(wl->presentation);
-   }
+   wl_present_destroy(&wl->present);
+   wl_frame_destroy(&wl->frame);
    if (wl->compositor)
       wl_compositor_destroy(wl->compositor);
    if (wl->registry)
       wl_registry_destroy(wl->registry);
+
+   if (wl->input.events)
+      RARCH_DBG("[Wayland] Input events handled: %u, of them on a thread"
+            " other than the frontend's: %u.\n",
+            wl->input.events, wl->input.events_elsewhere);
+   wl->input.events              = 0;
+   wl->input.events_elsewhere    = 0;
+
+   /* after the seat and its devices, which were on it, and before the
+    * connection */
+   if (wl->input.queue)
+      wl_event_queue_destroy(wl->input.queue);
+   wl->input.queue               = NULL;
 
    if (wl->input.dpy)
    {
@@ -571,7 +602,6 @@ void gfx_ctx_wl_destroy_resources_common(gfx_ctx_wayland_data_t *wl)
    wl->seat                      = NULL;
    wl->relative_pointer_manager  = NULL;
    wl->pointer_constraints       = NULL;
-   wl->presentation              = NULL;
    wl->content_type              = NULL;
    wl->content_type_manager      = NULL;
    wl->cursor_shape_manager      = NULL;
@@ -631,160 +661,6 @@ void gfx_ctx_wl_update_title_common(void *data)
       }
    }
 }
-
-static void presentation_handle_clock_id(void *data,
-                                         struct wp_presentation *presentation,
-                                         uint32_t clock_id)
-{
-   gfx_ctx_wayland_data_t *wl = data;
-
-   if (clock_id == CLOCK_MONOTONIC || clock_id == CLOCK_MONOTONIC_RAW)
-   {
-      wl->present_clock = true;
-      wl->present_clock_id = (clockid_t)clock_id;
-   }
-}
-
-static void presentation_feedback_sync_output(void *data,
-                                              struct wp_presentation_feedback *feedback,
-                                              struct wl_output *output)
-{
-}
-
-static void presentation_feedback_remove(gfx_ctx_wayland_data_t *wl,
-                                         struct wp_presentation_feedback *feedback)
-{
-   wl_present_feedback_t *fb, *tmp;
-   wl_list_for_each_safe(fb, tmp, &wl->feedbacks, link)
-   {
-      if (fb->feedback == feedback)
-      {
-         wl_list_remove(&fb->link);
-         wp_presentation_feedback_destroy(fb->feedback);
-         free(fb);
-         return;
-      }
-   }
-}
-
-static void presentation_feedback_presented(void *data,
-                                            struct wp_presentation_feedback *feedback,
-                                            uint32_t tv_sec_hi, uint32_t tv_sec_lo, uint32_t tv_nsec,
-                                            uint32_t refresh, uint32_t seq_hi, uint32_t seq_lo,
-                                            uint32_t flags)
-{
-   gfx_ctx_wayland_data_t *wl = data;
-   uint64_t                sec = ((uint64_t)tv_sec_hi << 32) | (uint64_t)tv_sec_lo;
-
-   presentation_feedback_remove(wl, feedback);
-
-   wl->last_ust         = sec * 1000000000ULL + (uint64_t)tv_nsec;
-   wl->last_msc         = ((uint64_t)seq_hi << 32) | (uint64_t)seq_lo;
-   wl->refresh_interval = (uint64_t)refresh;
-   wl->is_presented     = true;
-}
-
-static void presentation_feedback_discarded(void *data,
-                                            struct wp_presentation_feedback *feedback)
-{
-   gfx_ctx_wayland_data_t *wl = data;
-   presentation_feedback_remove(wl, feedback);
-}
-
-const struct wp_presentation_listener presentation_listener = {
-   presentation_handle_clock_id,
-};
-
-static const struct wp_presentation_feedback_listener presentation_feedback_listener = {
-   presentation_feedback_sync_output,
-   presentation_feedback_presented,
-   presentation_feedback_discarded,
-};
-
-void wl_presentation_dispatch_pending(gfx_ctx_wayland_data_t *wl)
-{
-   if (wl->presentation && wl->input.dpy)
-      wl_display_dispatch_pending(wl->input.dpy);
-}
-
-void wl_presentation_destroy_feedbacks(gfx_ctx_wayland_data_t *wl)
-{
-   wl_present_feedback_t *fb, *tmp;
-   wl_list_for_each_safe(fb, tmp, &wl->feedbacks, link)
-   {
-      wl_list_remove(&fb->link);
-      wp_presentation_feedback_destroy(fb->feedback);
-      free(fb);
-   }
-}
-
-void wl_request_presentation_feedback(gfx_ctx_wayland_data_t *wl)
-{
-   wl_present_feedback_t *fb = calloc(1, sizeof(*fb));
-   if (!fb)
-   {
-      RARCH_ERR("[Wayland] Failed to allocate feedback struct\n");
-      return;
-   }
-
-   fb->feedback = wp_presentation_feedback(wl->presentation, wl->surface);
-   if (!fb->feedback)
-   {
-      RARCH_ERR("[Wayland] Failed to create feedback object\n");
-      free(fb);
-      return;
-   }
-
-   wp_presentation_feedback_add_listener(fb->feedback,
-                                         &presentation_feedback_listener, wl);
-   wl_list_insert(&wl->feedbacks, &fb->link);
-}
-
-void wait_for_next_frame(gfx_ctx_wayland_data_t *wl)
-{
-   struct timespec ts;
-   struct timespec now;
-   clockid_t clock_type;
-   uint64_t now_ns;
-   uint64_t next_frame_ns;
-
-   if (!wl->present_clock || !wl->is_presented)
-      return;
-
-   if (wl->swap_interval == 0)
-      return;
-
-   if (wl->refresh_interval == 0)
-      return;
-
-   clock_type = (wl->present_clock_id == CLOCK_MONOTONIC_RAW)
-   ? CLOCK_MONOTONIC_RAW : CLOCK_MONOTONIC;
-
-   /* Calculate predicted next vblank:
-    * last_ust = absolute time the previous frame was displayed
-    * refresh_interval = compositor's prediction of time until next vblank
-    * So next_frame_ns = when the next frame should be displayed */
-   next_frame_ns = wl->last_ust + wl->refresh_interval;
-
-   if (clock_gettime(clock_type, &now) < 0)
-      return;
-
-   now_ns = (uint64_t)now.tv_sec * 1000000000ULL + (uint64_t)now.tv_nsec;
-
-   if (now_ns >= next_frame_ns)
-      return;
-
-   ts.tv_sec  = (time_t)(next_frame_ns / 1000000000ULL);
-   ts.tv_nsec = (long)(next_frame_ns % 1000000000ULL);
-
-   clock_nanosleep(clock_type, TIMER_ABSTIME, &ts, NULL);
-
-   /* Consume the timing data so we don't re-use stale values.
-    * New data will arrive when the compositor dispatches the
-    * next presentation_feedback.presented event. */
-   wl->is_presented = false;
-}
-
 
 static int create_shm_file(off_t size)
 {
@@ -1035,6 +911,99 @@ static bool wl_draw_splash_screen(gfx_ctx_wayland_data_t *wl)
 }
 #endif
 
+/* A window kept across a video reinit. The whole context is kept, so
+ * every proxy still hands its listener a live context. */
+static gfx_ctx_wayland_data_t *wl_kept = NULL;
+
+static void gfx_ctx_wl_destroy(gfx_ctx_wayland_data_t *wl)
+{
+#ifdef WEBOS
+   gfx_ctx_wl_destroy_resources_webos(wl);
+#else
+   gfx_ctx_wl_destroy_resources_common(wl);
+#endif
+   free(wl);
+}
+
+void gfx_ctx_wl_release_kept(void)
+{
+   gfx_ctx_wayland_data_t *wl = wl_kept;
+   wl_kept                    = NULL;
+   if (wl)
+      gfx_ctx_wl_destroy(wl);
+}
+
+void gfx_ctx_wl_free_common(gfx_ctx_wayland_data_t *wl, bool may_keep)
+{
+   if (!wl)
+      return;
+
+   gfx_ctx_wl_release_kept();
+
+   /* A content load reinits video without shutting the runloop down */
+   if (     may_keep
+         && wl->surface
+         && !(runloop_get_flags() & RUNLOOP_FLAG_SHUTDOWN_INITIATED))
+   {
+      wl_frame_cancel(&wl->frame);
+      /* The next context puts its own on the surface */
+      if (wl->tearing_control)
+         wp_tearing_control_v1_destroy(wl->tearing_control);
+      wl->tearing_control = NULL;
+      wl_color_detach(&wl->color);
+      wl_display_flush(wl->input.dpy);
+      wl_kept = wl;
+      RARCH_LOG("[Wayland] Keeping the window across the video reinit.\n");
+      return;
+   }
+
+   gfx_ctx_wl_destroy(wl);
+}
+
+static void gfx_ctx_wl_adopt(gfx_ctx_wayland_data_t *wl,
+      driver_configure_handler_t driver_configure_handler)
+{
+#ifdef HAVE_EGL
+   static const egl_ctx_data_t egl_zero = {0};
+#endif
+#ifdef HAVE_VULKAN
+   static const gfx_ctx_vulkan_data_t vk_zero = {0};
+#endif
+
+#ifdef HAVE_EGL
+   wl->egl                      = egl_zero;
+#endif
+#ifdef HAVE_VULKAN
+   wl->vk                       = vk_zero;
+#endif
+   wl->gl_gpu_list              = NULL;
+   wl->driver_configure_handler = driver_configure_handler;
+   /* Unlike a cold init there is no splash to protect */
+   wl->ignore_configuration     = false;
+
+   frontend_driver_destroy_signal_handler_state();
+#ifndef WEBOS
+   video_driver_display_type_set(RARCH_DISPLAY_WAYLAND);
+#endif
+   frontend_driver_install_signal_handler();
+   /* Video uninit forgot which output the window is on */
+   if (wl->current_output && wl->current_output->refresh_rate > 0)
+      video_driver_set_window_refresh_rate(
+            (float)wl->current_output->refresh_rate / 1000.0f);
+}
+
+gfx_ctx_wayland_data_t *gfx_ctx_wl_take_kept(
+      driver_configure_handler_t driver_configure_handler)
+{
+   gfx_ctx_wayland_data_t *wl = wl_kept;
+   if (!wl)
+      return NULL;
+   wl_kept = NULL;
+   gfx_ctx_wl_adopt(wl, driver_configure_handler);
+   RARCH_LOG("[Wayland] Took back the kept window.\n");
+   return wl;
+}
+
 bool gfx_ctx_wl_init_common(
       driver_configure_handler_t driver_configure_handler,
       gfx_ctx_wayland_data_t **wwl)
@@ -1043,6 +1012,11 @@ bool gfx_ctx_wl_init_common(
    gfx_ctx_wayland_data_t *wl;
    settings_t *settings         = config_get_ptr();
    unsigned video_monitor_index = settings->uints.video_monitor_index;
+
+   /* Whichever Wayland context comes next takes back the kept window:
+    * the previous one took its EGL window or Vulkan surface with it. */
+   if ((*wwl = gfx_ctx_wl_take_kept(driver_configure_handler)))
+      return true;
 
    *wwl                         = calloc(1, sizeof(gfx_ctx_wayland_data_t));
    wl                           = *wwl;
@@ -1064,16 +1038,25 @@ bool gfx_ctx_wl_init_common(
 
    wl_list_init(&wl->all_outputs);
    wl_list_init(&wl->current_outputs);
-   /* Must be initialised before the registry roundtrips below:
-    * if init fails after wp_presentation is bound (e.g. missing
-    * compositor/shm/xdg_shell), gfx_ctx_wl_destroy_resources_common()
-    * walks this list, and a calloc-zeroed wl_list is not a valid
-    * empty list. */
-   wl_list_init(&wl->feedbacks);
 
    frontend_driver_destroy_signal_handler_state();
 
    wl->input.dpy                    = wl_display_connect(NULL);
+   /* The seat's events get a queue of their own, which only the input
+    * driver's poll dispatches; see wayland_input_dispatch().
+    * RETROARCH_WAYLAND_INPUT_QUEUE=0 in the environment leaves them
+    * on the default queue, as they were. */
+   wl->input.queue                  = NULL;
+   wl->input.events                 = 0;
+   wl->input.events_elsewhere       = 0;
+#ifdef WAYLAND_HAVE_INPUT_QUEUE
+   if (wl->input.dpy)
+   {
+      const char *off = getenv("RETROARCH_WAYLAND_INPUT_QUEUE");
+      if (!off || off[0] != '0')
+         wl->input.queue            = wl_display_create_queue(wl->input.dpy);
+   }
+#endif
    wl->last_buffer_scale            = 1;
    wl->buffer_scale                 = 1;
    wl->pending_buffer_scale         = 1;
@@ -1102,6 +1085,15 @@ bool gfx_ctx_wl_init_common(
    wl_display_roundtrip(wl->input.dpy);
    /* second roundtrip for listeners on bound globals (wl_output, wl_seat) */
    wl_display_roundtrip(wl->input.dpy);
+   /* the seat's are on the input queue: its capabilities, and with
+    * them the keyboard and the pointer, are wanted before the window
+    * is set up, as they were when the roundtrip above brought them.
+    * The input driver is not polling yet, so nothing else dispatches
+    * this queue. */
+#ifdef WAYLAND_HAVE_INPUT_QUEUE
+   if (wl->input.queue)
+      wl_display_roundtrip_queue(wl->input.dpy, wl->input.queue);
+#endif
 
    /* The display's peak luminance, as the compositor describes the
     * output the surface is on or else the first it lists; it arrives
@@ -1195,7 +1187,7 @@ bool gfx_ctx_wl_init_common(
       RARCH_LOG("[Wayland] Compositor doesn't support the %s protocol.\n", xdg_toplevel_tag_manager_v1_interface.name);
    }
 
-   if (!wl->presentation)
+   if (!wl->present.presentation)
    {
       RARCH_LOG("[Wayland]: Compositor doesn't support the %s protocol.\n", wp_presentation_interface.name);
    }
@@ -1349,8 +1341,7 @@ bool gfx_ctx_wl_init_common(
    wl->input.mouse.focus     = true;
 
    wl->cursor.surface        = wl_compositor_create_surface(wl->compositor);
-   wl->cursor.theme          = wl_cursor_theme_load(NULL, 16, wl->shm);
-   wl->cursor.default_cursor = wl_cursor_theme_get_cursor(wl->cursor.theme, "left_ptr");
+   gfx_ctx_wl_cursor_load(wl);
 
    wl->num_active_touches    = 0;
 
@@ -1382,6 +1373,8 @@ bool gfx_ctx_wl_set_video_mode_common_size(gfx_ctx_wayland_data_t *wl,
    {
       unsigned bw              = VIDEO_SCALE_W(wl->buffer_dims);
       unsigned bh              = VIDEO_SCALE_H(wl->buffer_dims);
+      /* What a configure leaving the size to us restores */
+      wl->floating_dims        = wl->dims;
       wl->buffer_scale         = wl->pending_buffer_scale;
       wl->fractional_scale_num = wl->pending_fractional_scale_num;
       wl->buffer_dims          = VIDEO_SCALE_PACK(
@@ -1417,14 +1410,15 @@ bool gfx_ctx_wl_set_video_mode_common_size(gfx_ctx_wayland_data_t *wl,
 
 #define FULLSCREEN_CONFIGURE_TIMEOUT_MS 500
 
-static void gfx_ctx_wl_wait_for_fullscreen(gfx_ctx_wayland_data_t *wl)
+static void gfx_ctx_wl_wait_for_fullscreen(gfx_ctx_wayland_data_t *wl,
+      bool fullscreen)
 {
    struct timespec start, now;
    int remaining = FULLSCREEN_CONFIGURE_TIMEOUT_MS;
 
    clock_gettime(CLOCK_MONOTONIC, &start);
 
-   while (!wl->fullscreen && remaining > 0)
+   while (wl->fullscreen != fullscreen && remaining > 0)
    {
 #ifdef HAVE_LIBDECOR_H
       if (wl->libdecor)
@@ -1443,7 +1437,7 @@ static void gfx_ctx_wl_wait_for_fullscreen(gfx_ctx_wayland_data_t *wl)
          int ret;
 
          flush_wayland_fd(&wl->input);
-         if (wl->fullscreen)
+         if (wl->fullscreen == fullscreen)
             break;
 
          fd.fd      = wl->input.fd;
@@ -1465,8 +1459,9 @@ static void gfx_ctx_wl_wait_for_fullscreen(gfx_ctx_wayland_data_t *wl)
             + (now.tv_nsec - start.tv_nsec) / 1000000);
    }
 
-   if (!wl->fullscreen)
-      RARCH_WARN("[Wayland] No fullscreen configure received; continuing.\n");
+   if (wl->fullscreen != fullscreen)
+      RARCH_WARN("[Wayland] No %s configure received; continuing.\n",
+            fullscreen ? "fullscreen" : "windowed");
 }
 
 bool gfx_ctx_wl_set_video_mode_common_fullscreen(gfx_ctx_wayland_data_t *wl,
@@ -1523,7 +1518,18 @@ bool gfx_ctx_wl_set_video_mode_common_fullscreen(gfx_ctx_wayland_data_t *wl,
 
       /* Map only once fullscreen, or window managers such as tiling
        * scripts place the window as a normal one first. */
-      gfx_ctx_wl_wait_for_fullscreen(wl);
+      gfx_ctx_wl_wait_for_fullscreen(wl, true);
+   }
+   else if (wl->fullscreen)
+   {
+      /* A window kept across the reinit is still fullscreen */
+#ifdef HAVE_LIBDECOR_H
+      if (wl->libdecor)
+         wl->libdecor_frame_unset_fullscreen(wl->libdecor_frame);
+      else
+#endif
+         xdg_toplevel_unset_fullscreen(wl->xdg_toplevel);
+      gfx_ctx_wl_wait_for_fullscreen(wl, false);
    }
 
    flush_wayland_fd(&wl->input);
@@ -1607,14 +1613,6 @@ static void shm_buffer_handle_release(void *data,
 
    shm_buffer_free(buffer);
 }
-
-#if 0
-static void xdg_surface_handle_configure(void *data,
-      struct xdg_surface *surface, uint32_t serial)
-{
-   xdg_surface_ack_configure(surface, serial);
-}
-#endif
 
 const struct wl_buffer_listener shm_buffer_listener = {
    shm_buffer_handle_release,

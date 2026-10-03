@@ -15,7 +15,7 @@
 /* The GameCube/Wii video mode table and the rules that turn one of
  * its entries into what the VI is actually programmed with. Nothing
  * here touches libogc: the TV standard comes in as a
- * gx_vi_standard_t (dispserv_gx.c fills it from the console), so the
+ * gx_vi_standard_t (dispserv_gx_libogc.c fills it from the console), so the
  * display server's mode list and the video driver's mode switch are
  * worked out by the same code, and a host build can test it. */
 
@@ -32,9 +32,9 @@
 RETRO_BEGIN_DECLS
 
 /* Id 0 is "let the console choose" (VIDEO_GetPreferredMode); ids
- * 1..gx_modes_count()-1 are the fixed entries. The ids are what
- * current_resolution_id stores in the config, so the table's order
- * must never change - new entries go at the end. */
+ * 1..gx_modes_count()-1 are the fixed entries.  The configuration
+ * holds a mode as the fullscreen size, which gx_modes_id() maps
+ * back. */
 #define GX_MODE_ID_DEFAULT 0
 
 typedef struct gx_vi_standard
@@ -63,8 +63,9 @@ unsigned gx_modes_count(void);
  * default and for an id out of range. */
 unsigned gx_modes_dims(unsigned id);
 
-/* An id from the config made safe: out of range becomes the default. */
-unsigned gx_modes_clamp_id(unsigned id);
+/* The id a configured fullscreen size selects under std: the default
+ * for 0x0 and for a size std has no mode of. */
+unsigned gx_modes_id(const gx_vi_standard_t *std, unsigned dims);
 
 /* What the VI runs for dims (0 = the preferred mode) under std. */
 void gx_modes_resolve(const gx_vi_standard_t *std, unsigned dims,

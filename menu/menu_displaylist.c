@@ -401,6 +401,31 @@ static void menu_file_browser_prepare_extensions(
    free(stems);
 }
 
+/* True when Parent Directory from @dir would land on the filesystem
+ * root while the drive list does not offer it (webOS, Play Store
+ * Android).  Going up then stops at the drive list - reached with
+ * Back - rather than listing a root the platform keeps out of reach.
+ * Decided by the frontend's drive list, not by platform here. */
+static bool filebrowser_parent_is_hidden_root(const char *dir)
+{
+   size_t _len;
+   const char *slash;
+
+   if (!dir || dir[0] != '/')
+      return false;
+   if (frontend_driver_root_in_drive_list())
+      return false;
+
+   _len = strlen(dir);
+   while (_len > 1 && dir[_len - 1] == '/')
+      _len--;
+   /* "/" itself, or a direct child of it ("/tmp", "/media/"). */
+   for (slash = dir + _len; slash > dir; slash--)
+      if (slash[-1] == '/')
+         break;
+   return slash - 1 == dir;
+}
+
 static int filebrowser_parse(
       file_list_t *info_list,
       const char *path,
@@ -783,6 +808,9 @@ static int filebrowser_parse(
 #undef RESOLVE_SUBSYSTEM
 
 end:
+   if (allow_parent_directory && filebrowser_parent_is_hidden_root(full_path))
+      allow_parent_directory = false;
+
    if (!path_is_compressed && allow_parent_directory)
       menu_entries_prepend(info_list,
             msg_hash_to_str(MENU_ENUM_LABEL_VALUE_PARENT_DIRECTORY),
@@ -2849,6 +2877,134 @@ static unsigned menu_displaylist_parse_display_edid(file_list_t *list)
 }
 #endif
 
+/* Each port with a device in it: its name, marked when no autoconfig
+ * profile matched it, and on RGUI the display and configuration names
+ * and VID/PID.  Every row carries its port in entry_idx. */
+static unsigned menu_displaylist_parse_input_info(file_list_t *list)
+{
+   char entry[NAME_MAX_LENGTH];
+   unsigned port;
+   unsigned count          = 0;
+   const char *menu_driver = menu_driver_ident();
+
+   for (port = 0; port < MAX_USERS; port++)
+   {
+      const char *name = input_config_get_device_name(port);
+      size_t _len;
+      if (!name)
+         continue;
+
+      /* Port and Device Name */
+      _len = snprintf(entry, sizeof(entry), /* Note: format string below */
+            msg_hash_to_str(MENU_ENUM_LABEL_VALUE_PORT_DEVICE_NAME),
+            port + 1, name);
+      if (!input_config_get_device_autoconfigured(port) && _len < sizeof(entry))
+         snprintf(entry + _len, sizeof(entry) - _len, " (%s)",
+               msg_hash_to_str(MENU_ENUM_LABEL_VALUE_PORT_DEVICE_NO_PROFILE));
+      if (menu_entries_append(list, entry, "",
+            MENU_ENUM_LABEL_SYSTEM_INFO_CONTROLLER_ENTRY,
+            MENU_SETTINGS_CORE_INFO_NONE, 0, port, NULL))
+         count++;
+
+#ifdef HAVE_RGUI
+      if (!strcmp(menu_driver, "rgui"))
+      {
+         /* Device Display Name */
+         snprintf(entry, sizeof(entry), /* TODO/FIXME: localize */
+               "- Device Display Name: %s",
+               input_config_get_device_display_name(port)
+               ? input_config_get_device_display_name(port)
+               : msg_hash_to_str(MENU_ENUM_LABEL_VALUE_NOT_AVAILABLE));
+         if (menu_entries_append(list, entry, "",
+               MENU_ENUM_LABEL_SYSTEM_INFO_CONTROLLER_ENTRY,
+               MENU_SETTINGS_CORE_INFO_NONE, 0, port, NULL))
+            count++;
+
+         /* Device Config Name */
+         snprintf(entry, sizeof(entry), /* TODO: localize */
+               "- Device Config Name: %s",
+               input_config_get_device_config_name(port)
+               ? input_config_get_device_config_name(port)
+               : msg_hash_to_str(MENU_ENUM_LABEL_VALUE_NOT_AVAILABLE));
+         if (menu_entries_append(list, entry, "",
+               MENU_ENUM_LABEL_SYSTEM_INFO_CONTROLLER_ENTRY,
+               MENU_SETTINGS_CORE_INFO_NONE, 0, port, NULL))
+            count++;
+
+         /* Device VID/PID */
+         snprintf(entry, sizeof(entry), /* TODO: localize */
+               "- Device VID/PID: %d/%d",
+               input_config_get_device_vid(port),
+               input_config_get_device_pid(port));
+         if (menu_entries_append(list, entry, "",
+               MENU_ENUM_LABEL_SYSTEM_INFO_CONTROLLER_ENTRY,
+               MENU_SETTINGS_CORE_INFO_NONE, 0, port, NULL))
+            count++;
+      }
+#endif
+   }
+
+   /* The keyboards, where the input driver can tell them apart */
+   for (port = 0; port < MAX_INPUT_DEVICES; port++)
+   {
+      const char *name = input_config_get_keyboard_display_name(port);
+      if (!name)
+         continue;
+      snprintf(entry, sizeof(entry),
+            msg_hash_to_str(MENU_ENUM_LABEL_VALUE_KEYBOARD_DEVICE_NAME),
+            port + 1, name);
+      if (menu_entries_append(list, entry, "",
+            MENU_ENUM_LABEL_SYSTEM_INFO_KEYBOARD_ENTRY,
+            MENU_SETTINGS_CORE_INFO_NONE, 0, port, NULL))
+         count++;
+   }
+
+   /* The mice. Each is numbered by its Mouse Index, the number a port
+    * is given it by. One mouse on the desk is often more than one of
+    * the input driver's mice: where the driver says which belong
+    * together they are one line, with all of their numbers. */
+   for (port = 0; port < MAX_INPUT_DEVICES; port++)
+   {
+      char numbers[64];
+      unsigned other;
+      size_t _len;
+      const char *name   = input_config_get_mouse_display_name(port);
+      const char *device = input_config_get_mouse_device(port);
+
+      if (!name || input_config_get_mouse_hidden(port))
+         continue;
+      /* a part of a mouse that is listed already */
+      for (other = 0; other < port; other++)
+         if (     *device
+               && input_config_get_mouse_display_name(other)
+               && !input_config_get_mouse_hidden(other)
+               && string_is_equal(device, input_config_get_mouse_device(other)))
+            break;
+      if (other < port)
+         continue;
+
+      _len = snprintf(numbers, sizeof(numbers), "%u", port + 1);
+      for (other = port + 1; other < MAX_INPUT_DEVICES; other++)
+         if (     *device
+               && _len < sizeof(numbers)
+               && input_config_get_mouse_display_name(other)
+               && !input_config_get_mouse_hidden(other)
+               && string_is_equal(device, input_config_get_mouse_device(other)))
+            _len += snprintf(numbers + _len, sizeof(numbers) - _len,
+                  ", %u", other + 1);
+
+      snprintf(entry, sizeof(entry),
+            msg_hash_to_str(MENU_ENUM_LABEL_VALUE_MOUSE_DEVICE_NAME),
+            numbers, name);
+      if (menu_entries_append(list, entry, "",
+            MENU_ENUM_LABEL_SYSTEM_INFO_MOUSE_ENTRY,
+            MENU_SETTINGS_CORE_INFO_NONE, 0, port, NULL))
+         count++;
+   }
+
+   return count;
+}
+
 static unsigned menu_displaylist_parse_system_info(file_list_t *list)
 {
    char entry[NAME_MAX_LENGTH];
@@ -3043,64 +3199,6 @@ static unsigned menu_displaylist_parse_system_info(file_list_t *list)
       }
    }
 #endif
-
-   /* Input devices */
-   {
-      const char *menu_driver = menu_driver_ident();
-      unsigned controller;
-      for (controller = 0; controller < MAX_USERS; controller++)
-      {
-         if (input_config_get_device_autoconfigured(controller))
-         {
-            /* Port and Device Name */
-            snprintf(entry, sizeof(entry), /* Note: format string below */
-                  msg_hash_to_str(MENU_ENUM_LABEL_VALUE_PORT_DEVICE_NAME),
-                  controller + 1,
-                  input_config_get_device_name(controller));
-            if (menu_entries_append(list, entry, "",
-                  MENU_ENUM_LABEL_SYSTEM_INFO_CONTROLLER_ENTRY,
-                  MENU_SETTINGS_CORE_INFO_NONE, 0, 0, NULL))
-               count++;
-
-#ifdef HAVE_RGUI
-            if (!strcmp(menu_driver, "rgui"))
-            {
-               /* Device Display Name */
-               snprintf(entry, sizeof(entry), /* TODO/FIXME: localize */
-                     "- Device Display Name: %s",
-                     input_config_get_device_display_name(controller)
-                     ? input_config_get_device_display_name(controller)
-                     : msg_hash_to_str(MENU_ENUM_LABEL_VALUE_NOT_AVAILABLE));
-               if (menu_entries_append(list, entry, "",
-                     MENU_ENUM_LABEL_SYSTEM_INFO_CONTROLLER_ENTRY,
-                     MENU_SETTINGS_CORE_INFO_NONE, 0, 0, NULL))
-                  count++;
-
-               /* Device Config Name */
-               snprintf(entry, sizeof(entry), /* TODO: localize */
-                     "- Device Config Name: %s",
-                     input_config_get_device_config_name(controller)
-                     ? input_config_get_device_config_name(controller)
-                     : msg_hash_to_str(MENU_ENUM_LABEL_VALUE_NOT_AVAILABLE));
-               if (menu_entries_append(list, entry, "",
-                     MENU_ENUM_LABEL_SYSTEM_INFO_CONTROLLER_ENTRY,
-                     MENU_SETTINGS_CORE_INFO_NONE, 0, 0, NULL))
-                  count++;
-
-               /* Device VID/PID */
-               snprintf(entry, sizeof(entry), /* TODO: localize */
-                     "- Device VID/PID: %d/%d",
-                     input_config_get_device_vid(controller),
-                     input_config_get_device_pid(controller));
-               if (menu_entries_append(list, entry, "",
-                     MENU_ENUM_LABEL_SYSTEM_INFO_CONTROLLER_ENTRY,
-                     MENU_SETTINGS_CORE_INFO_NONE, 0, 0, NULL))
-                  count++;
-            }
-#endif
-         }
-      }
-   }
 
    {
       const frontend_ctx_driver_t *frontend = frontend_get_ptr();
@@ -3722,6 +3820,30 @@ static int create_string_list_rdb_entry_int(
    return 0;
 }
 
+/* Translatable name for a 1-based release month, or MSG_UNKNOWN when
+ * the database holds something outside 1-12 (the caller then shows
+ * the raw number, as before). */
+static enum msg_hash_enums month_uint_to_menu_label_value(unsigned month)
+{
+   static const enum msg_hash_enums months[12] = {
+      MENU_ENUM_LABEL_VALUE_RDB_ENTRY_RELEASE_MONTH_JANUARY,
+      MENU_ENUM_LABEL_VALUE_RDB_ENTRY_RELEASE_MONTH_FEBRUARY,
+      MENU_ENUM_LABEL_VALUE_RDB_ENTRY_RELEASE_MONTH_MARCH,
+      MENU_ENUM_LABEL_VALUE_RDB_ENTRY_RELEASE_MONTH_APRIL,
+      MENU_ENUM_LABEL_VALUE_RDB_ENTRY_RELEASE_MONTH_MAY,
+      MENU_ENUM_LABEL_VALUE_RDB_ENTRY_RELEASE_MONTH_JUNE,
+      MENU_ENUM_LABEL_VALUE_RDB_ENTRY_RELEASE_MONTH_JULY,
+      MENU_ENUM_LABEL_VALUE_RDB_ENTRY_RELEASE_MONTH_AUGUST,
+      MENU_ENUM_LABEL_VALUE_RDB_ENTRY_RELEASE_MONTH_SEPTEMBER,
+      MENU_ENUM_LABEL_VALUE_RDB_ENTRY_RELEASE_MONTH_OCTOBER,
+      MENU_ENUM_LABEL_VALUE_RDB_ENTRY_RELEASE_MONTH_NOVEMBER,
+      MENU_ENUM_LABEL_VALUE_RDB_ENTRY_RELEASE_MONTH_DECEMBER
+   };
+   if (month < 1 || month > 12)
+      return MSG_UNKNOWN;
+   return months[month - 1];
+}
+
 static int menu_displaylist_parse_database_entry(menu_handle_t *menu,
       menu_displaylist_info_t *info,
       bool show_advanced_settings,
@@ -4015,8 +4137,24 @@ static int menu_displaylist_parse_database_entry(menu_handle_t *menu,
       RDB_ENTRY_INT(edge_magazine_issue,  MENU_ENUM_LABEL_RDB_ENTRY_EDGE_MAGAZINE_ISSUE,
                                           MENU_ENUM_LABEL_VALUE_RDB_ENTRY_EDGE_MAGAZINE_ISSUE)
 
-      RDB_ENTRY_INT(releasemonth,        MENU_ENUM_LABEL_RDB_ENTRY_RELEASE_MONTH,
+      if (db_info_entry->releasemonth)
+      {
+         enum msg_hash_enums month_enum =
+               month_uint_to_menu_label_value(db_info_entry->releasemonth);
+
+         if (month_enum == MSG_UNKNOWN)
+         {
+            RDB_ENTRY_INT(releasemonth,  MENU_ENUM_LABEL_RDB_ENTRY_RELEASE_MONTH,
                                           MENU_ENUM_LABEL_VALUE_RDB_ENTRY_RELEASE_MONTH)
+         }
+         else if (create_string_list_rdb_entry_string(
+                  MENU_ENUM_LABEL_RDB_ENTRY_RELEASE_MONTH,
+                  msg_hash_to_str(MENU_ENUM_LABEL_VALUE_RDB_ENTRY_RELEASE_MONTH),
+                  msg_hash_to_str(MENU_ENUM_LABEL_RDB_ENTRY_RELEASE_MONTH),
+                  msg_hash_to_str(month_enum), info->path, info->list) == -1)
+            goto error;
+      }
+
       RDB_ENTRY_INT(releaseyear,         MENU_ENUM_LABEL_RDB_ENTRY_RELEASE_YEAR,
                                           MENU_ENUM_LABEL_VALUE_RDB_ENTRY_RELEASE_YEAR)
 
@@ -5098,6 +5236,13 @@ static unsigned menu_displaylist_parse_information_list(file_list_t *info_list)
          msg_hash_to_str(MENU_ENUM_LABEL_VALUE_DISPLAY_INFORMATION),
          MENU_ENUM_LABEL_DISPLAY_INFORMATION_STR,
          MENU_ENUM_LABEL_DISPLAY_INFORMATION,
+         MENU_SETTING_ACTION, 0, 0, NULL))
+      count++;
+
+   if (menu_entries_append(info_list,
+         msg_hash_to_str(MENU_ENUM_LABEL_VALUE_INPUT_INFORMATION),
+         MENU_ENUM_LABEL_INPUT_INFORMATION_STR,
+         MENU_ENUM_LABEL_INPUT_INFORMATION,
          MENU_SETTING_ACTION, 0, 0, NULL))
       count++;
 
@@ -8329,7 +8474,7 @@ void menu_displaylist_validation_dump(rarch_setting_t *list_settings)
             || t == (unsigned)DISPLAYLIST_SYSTEM_INFO
             || t == (unsigned)DISPLAYLIST_DISPLAY_INFO
             || t == (unsigned)DISPLAYLIST_DISPLAY_EDID_INFO
-            || t == (unsigned)DISPLAYLIST_HELP_SCREEN_LIST
+            || t == (unsigned)DISPLAYLIST_INPUT_INFO
             /* The core-content family reaches for the network and
              * blocks headless; nothing deterministic lives there. */
             || (t >= (unsigned)DISPLAYLIST_CORE_CONTENT
@@ -8367,7 +8512,7 @@ void menu_displaylist_validation_dump(rarch_setting_t *list_settings)
             || t == (unsigned)DISPLAYLIST_SYSTEM_INFO
             || t == (unsigned)DISPLAYLIST_DISPLAY_INFO
             || t == (unsigned)DISPLAYLIST_DISPLAY_EDID_INFO
-            || t == (unsigned)DISPLAYLIST_HELP_SCREEN_LIST
+            || t == (unsigned)DISPLAYLIST_INPUT_INFO
             /* The core-content family reaches for the network and
              * blocks headless; nothing deterministic lives there. */
             || (t >= (unsigned)DISPLAYLIST_CORE_CONTENT
@@ -8406,7 +8551,7 @@ void menu_displaylist_validation_dump(rarch_setting_t *list_settings)
             || t == (unsigned)DISPLAYLIST_SYSTEM_INFO
             || t == (unsigned)DISPLAYLIST_DISPLAY_INFO
             || t == (unsigned)DISPLAYLIST_DISPLAY_EDID_INFO
-            || t == (unsigned)DISPLAYLIST_HELP_SCREEN_LIST
+            || t == (unsigned)DISPLAYLIST_INPUT_INFO
             || (t >= (unsigned)DISPLAYLIST_CORE_CONTENT
                   && t <= (unsigned)DISPLAYLIST_CORE_SYSTEM_FILES))
       {
@@ -9251,6 +9396,9 @@ unsigned menu_displaylist_build_list(
       case DISPLAYLIST_DISPLAY_INFO:
          count              = menu_displaylist_parse_display_info(list);
          break;
+      case DISPLAYLIST_INPUT_INFO:
+         count              = menu_displaylist_parse_input_info(list);
+         break;
       case DISPLAYLIST_DISPLAY_EDID_INFO:
 #ifdef HAVE_MODELINE
          count              = menu_displaylist_parse_display_edid(list);
@@ -9785,6 +9933,10 @@ unsigned menu_displaylist_build_list(
 #endif
 #ifdef ANDROID
                {MENU_ENUM_LABEL_ANDROID_INPUT_DISCONNECT_WORKAROUND,   PARSE_ONLY_BOOL,  true},
+               {MENU_ENUM_LABEL_INPUT_STYLUS_ENABLE,                   PARSE_ONLY_BOOL,  true},
+               {MENU_ENUM_LABEL_INPUT_STYLUS_REQUIRE_CONTACT_FOR_CLICK, PARSE_ONLY_BOOL,  true},
+               {MENU_ENUM_LABEL_INPUT_STYLUS_HOVER_MOVES_POINTER,      PARSE_ONLY_BOOL,  true},
+               {MENU_ENUM_LABEL_INPUT_STYLUS_PRESSURE_SENSITIVITY,    PARSE_ONLY_UINT,  true},
                {MENU_ENUM_LABEL_INPUT_BLOCK_TIMEOUT,                   PARSE_ONLY_UINT,  true},
 #endif
                {MENU_ENUM_LABEL_INPUT_POLL_TYPE_BEHAVIOR,              PARSE_ONLY_UINT,  true},
@@ -10877,7 +11029,7 @@ unsigned menu_displaylist_build_list(
                   count++;
             }
 
-#ifdef HAVE_NETWORK_CMD
+#ifdef HAVE_MCP
             if (MENU_DISPLAYLIST_PARSE_SETTINGS_ENUM(list,
                   MENU_ENUM_LABEL_MCP_SERVER_ENABLE,
                   PARSE_ONLY_BOOL, false) == 0)
@@ -12079,7 +12231,6 @@ unsigned menu_displaylist_build_list(
 #endif
                {MENU_ENUM_LABEL_MENU_SHOW_INFORMATION,                                 PARSE_ONLY_BOOL, true  },
                {MENU_ENUM_LABEL_MENU_SHOW_CONFIGURATIONS,                              PARSE_ONLY_BOOL, true  },
-               {MENU_ENUM_LABEL_MENU_SHOW_HELP,                                        PARSE_ONLY_BOOL, true  },
                {MENU_ENUM_LABEL_SHOW_WIMP,                                             PARSE_ONLY_UINT, true  },
 #if !TARGET_OS_IPHONE
                {MENU_ENUM_LABEL_MENU_SHOW_QUIT_RETROARCH,                              PARSE_ONLY_BOOL, true  },
@@ -13135,6 +13286,7 @@ unsigned menu_displaylist_build_list(
                {MENU_ENUM_LABEL_CORE_UPDATER_SHOW_EXPERIMENTAL_CORES,  PARSE_ONLY_BOOL},
                {MENU_ENUM_LABEL_CORE_UPDATER_AUTO_BACKUP,              PARSE_ONLY_BOOL},
                {MENU_ENUM_LABEL_CORE_UPDATER_AUTO_BACKUP_HISTORY_SIZE, PARSE_ONLY_UINT},
+               {MENU_ENUM_LABEL_CORE_UPDATER_AUTO_BACKUP_COMPRESS,     PARSE_ONLY_BOOL},
             };
 
             for (i = 0; i < ARRAY_SIZE(build_list); i++)
@@ -13569,7 +13721,7 @@ unsigned menu_displaylist_build_list(
                {MENU_ENUM_LABEL_AUDIO_FASTFORWARD_CALLBACK,  PARSE_ONLY_BOOL,  true },
                {MENU_ENUM_LABEL_SLOWMOTION_RATIO,            PARSE_ONLY_FLOAT, true },
                {MENU_ENUM_LABEL_VRR_RUNLOOP_ENABLE,          PARSE_ONLY_BOOL,  true },
-               {MENU_ENUM_LABEL_MENU_THROTTLE_FRAMERATE,     PARSE_ONLY_BOOL,  false},
+               {MENU_ENUM_LABEL_MENU_FRAME_RATE,             PARSE_ONLY_UINT,  true },
             };
 
 #ifdef HAVE_REWIND
@@ -13589,18 +13741,6 @@ unsigned menu_displaylist_build_list(
                }
             }
 #endif
-
-            for (i = 0; i < ARRAY_SIZE(build_list); i++)
-            {
-               switch (build_list[i].enum_idx)
-               {
-                  case MENU_ENUM_LABEL_MENU_THROTTLE_FRAMERATE:
-                     build_list[i].checked = settings->bools.vrr_runloop_enable;
-                     break;
-                  default:
-                     break;
-               }
-            }
 
             for (i = 0; i < ARRAY_SIZE(build_list); i++)
             {
@@ -16415,13 +16555,13 @@ static bool menu_displaylist_ctl_internal(
          case DISPLAYLIST_MICROPHONE_SETTINGS_LIST:
 #endif
          case DISPLAYLIST_AUDIO_SYNCHRONIZATION_SETTINGS_LIST:
-         case DISPLAYLIST_HELP_SCREEN_LIST:
          case DISPLAYLIST_INFORMATION_LIST:
          case DISPLAYLIST_EXPLORE:
          case DISPLAYLIST_SCAN_DIRECTORY_LIST:
          case DISPLAYLIST_SYSTEM_INFO:
          case DISPLAYLIST_DISPLAY_INFO:
          case DISPLAYLIST_DISPLAY_EDID_INFO:
+         case DISPLAYLIST_INPUT_INFO:
          case DISPLAYLIST_BLUETOOTH_SETTINGS_LIST:
          case DISPLAYLIST_WIFI_SETTINGS_LIST:
          case DISPLAYLIST_WIFI_NETWORKS_LIST:
@@ -16485,6 +16625,7 @@ static bool menu_displaylist_ctl_internal(
                   case DISPLAYLIST_DROPDOWN_LIST_DISK_INDEX:
                   case DISPLAYLIST_INFORMATION_LIST:
                   case DISPLAYLIST_SCAN_DIRECTORY_LIST:
+                  case DISPLAYLIST_INPUT_INFO:
                      menu_entries_append(info->list,
                            msg_hash_to_str(MENU_ENUM_LABEL_VALUE_NO_ENTRIES_TO_DISPLAY),
                            MENU_ENUM_LABEL_NO_ENTRIES_TO_DISPLAY_STR,
@@ -17873,6 +18014,14 @@ static bool menu_displaylist_ctl_internal(
                                  {
                                     char val_s[NAME_MAX_LENGTH];
                                     int val = i;
+                                    /* Mouse Index: the mice there are,
+                                     * and the one chosen now whatever
+                                     * it is */
+                                    if (     setting->enum_idx >= MENU_ENUM_LABEL_INPUT_MOUSE_INDEX
+                                          && setting->enum_idx <= MENU_ENUM_LABEL_INPUT_MOUSE_INDEX_LAST
+                                          && val != (int)orig_value
+                                          && !input_config_mouse_offered((unsigned)val))
+                                       continue;
                                     setting_uint_set(setting, val);
                                     setting->actions->repr(setting,
                                           val_s, sizeof(val_s));
@@ -18240,6 +18389,13 @@ static bool menu_displaylist_ctl_internal(
                               {
                                  char val_s[NAME_MAX_LENGTH];
                                  int val = i;
+                                 /* Mouse Index: the mice there are, and
+                                  * the one chosen now whatever it is */
+                                 if (     setting->enum_idx >= MENU_ENUM_LABEL_INPUT_MOUSE_INDEX
+                                       && setting->enum_idx <= MENU_ENUM_LABEL_INPUT_MOUSE_INDEX_LAST
+                                       && val != (int)orig_value
+                                       && !input_config_mouse_offered((unsigned)val))
+                                    continue;
                                  setting_uint_set(setting, val);
                                  setting->actions->repr(setting,
                                        val_s, sizeof(val_s));

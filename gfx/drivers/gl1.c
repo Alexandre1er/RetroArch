@@ -391,6 +391,7 @@ typedef struct
    gl1_t *gl;
    GLuint tex;
    unsigned tex_dims;            /* VIDEO_SCALE_PACK, the atlas texture */
+   bool respecify;               /* The atlas grew: remake the texture */
 
    const font_renderer_driver_t *font_driver;
    void *font_data;
@@ -732,6 +733,16 @@ static void *gl1_raster_font_init(void *data,
    font->atlas      = font->font_driver->get_atlas(font->font_data);
    font->tex_dims   = VIDEO_SCALE_PACK(next_pow2(font->atlas->width),
          next_pow2(font->atlas->height));
+   /* The atlas may grow, up to the largest texture there is */
+   {
+      GLint max_tex = 0;
+      glGetIntegerv(GL_MAX_TEXTURE_SIZE, &max_tex);
+      if (max_tex > 0)
+      {
+         font->atlas->max_width  = (unsigned)max_tex;
+         font->atlas->max_height = (unsigned)max_tex;
+      }
+   }
 
    gl1_raster_font_upload_atlas(font, 0, 0, true);
 
@@ -746,36 +757,11 @@ static void *gl1_raster_font_init(void *data,
 static int gl1_raster_font_get_message_width(void *data, const char *msg,
       size_t msg_len, float scale)
 {
-   void *font_data;
-   const struct font_glyph* (*get_glyph)(void*, uint32_t);
-   const struct font_glyph* glyph_q = NULL;
-   gl1_raster_t *font  = (gl1_raster_t*)data;
-   const char* msg_end = msg + msg_len;
-   int delta_x         = 0;
-
-   if (     !font
-         || !font->font_driver
-         || !font->font_data )
+   gl1_raster_t *font = (gl1_raster_t*)data;
+   if (!font)
       return 0;
-
-   get_glyph = font->font_driver->get_glyph;
-   font_data = font->font_data;
-   glyph_q   = get_glyph(font_data, '?');
-
-   while (msg < msg_end)
-   {
-      const struct font_glyph *glyph;
-      unsigned code = utf8_walk(&msg);
-
-      /* Do something smarter here ... */
-      if (!(glyph = get_glyph(font_data, code)))
-         if (!(glyph = glyph_q))
-            continue;
-
-      delta_x += glyph->advance_x;
-   }
-
-   return delta_x * scale;
+   return font_renderer_get_message_width(font->font_driver,
+         font->font_data, msg, msg_len, scale);
 }
 
 static void gl1_raster_font_draw_vertices(
@@ -783,7 +769,13 @@ static void gl1_raster_font_draw_vertices(
       gl1_raster_t *font,
       const video_coords_t *coords)
 {
-   if (font->atlas->dirty)
+   if (font->respecify)
+   {
+      gl1_raster_font_upload_atlas(font, 0, 0, true);
+      font->respecify      = false;
+      font->atlas->dirty   = false;
+   }
+   else if (font->atlas->dirty)
    {
       gl1_raster_font_upload_atlas(font,
             font->atlas->dirty_y0, font->atlas->dirty_y1, false);
@@ -824,61 +816,51 @@ static void gl1_raster_font_draw_vertices(
    glPopMatrix();
 }
 
-static void gl1_raster_font_render_line(gl1_t *gl,
-      gl1_raster_t *font,
-      const struct font_glyph* glyph_q,
-      const char *msg,
-      size_t msg_len,
-      GLfloat scale,
-      const GLfloat color[4],
-      GLfloat pos_x,
-      GLfloat pos_y,
-      int pre_x,
+#define GL1_RASTER_FONT_FLUSH() \
+   do \
+   { \
+      coords.tex_coord     = font_tex_coords; \
+      coords.vertex        = font_vertex; \
+      coords.color         = font_color; \
+      coords.vertices      = i * 6; \
+      coords.lut_tex_coord = NULL; \
+      if (font->block) \
+         video_coord_array_append(&font->block->carr, &coords, coords.vertices); \
+      else \
+         gl1_raster_font_draw_vertices(gl, font, &coords); \
+      i = 0; \
+   } while (0)
+
+static void gl1_raster_font_render_message(gl1_t *gl,
+      gl1_raster_t *font, const char *msg, size_t msg_len,
+      GLfloat scale, const GLfloat color[4], GLfloat pos_x, GLfloat pos_y,
       float inv_tex_size_x,
       float inv_tex_size_y,
       float inv_win_width,
       float inv_win_height,
       unsigned text_align)
 {
-   int i;
    struct video_coords coords;
-   GLfloat *font_tex_coords = font->font_tex_coords;
-   GLfloat *font_vertex     = font->font_vertex;
-   GLfloat *font_color      = font->font_color;
    GLfloat color_block[4 * 6];
    int n;
-   const char* msg_end  = msg + msg_len;
-   int x                = pre_x;
-   int y                = roundf(pos_y * VIDEO_SCALE_H(gl->vp.dims));
-   int delta_x          = 0;
-   int delta_y          = 0;
-   const struct font_glyph* (*get_glyph)(void*, uint32_t) = font->font_driver->get_glyph;
-   void *font_data      = font->font_data;
+   float line_height;
+   struct font_line_metrics *line_metrics = NULL;
+   int i                                  = 0;
+   int x                                  = 0;
+   int y                                  = 0;
+   GLfloat *font_tex_coords               = font->font_tex_coords;
+   GLfloat *font_vertex                   = font->font_vertex;
+   GLfloat *font_color                    = font->font_color;
+   int pre_x                              = roundf(pos_x * VIDEO_SCALE_W(gl->vp.dims));
+   const struct font_glyph* (*get_glyph)(void*, uint32_t)
+                                          = font->font_driver->get_glyph;
+   void *font_data                        = font->font_data;
+   const struct font_glyph *glyph_q       = get_glyph(font_data, '?');
+   bool aligned                           = (text_align == TEXT_ALIGN_RIGHT
+                                         || text_align == TEXT_ALIGN_CENTER);
 
-   /* For right/center alignment, compute width with a lightweight pass
-    * that only accumulates advance_x — avoids the redundant glyph lookups
-    * and atlas dirty checks that gl1_raster_font_get_message_width 
-    * would repeat. */
-   if (text_align == TEXT_ALIGN_RIGHT || text_align == TEXT_ALIGN_CENTER)
-   {
-      int width_accum      = 0;
-      const char *scan     = msg;
-      const char *scan_end = msg_end;
-      while (scan < scan_end)
-      {
-         const struct font_glyph *glyph;
-         uint32_t code       = utf8_walk(&scan);
-         if (!(glyph = get_glyph(font_data, code)))
-            if (!(glyph = glyph_q))
-               continue;
-         width_accum += glyph->advance_x;
-      }
-
-      if (text_align == TEXT_ALIGN_RIGHT)
-         x -= (int)(width_accum * scale);
-      else
-         x -= (int)(width_accum * scale) / 2;
-   }
+   font->font_driver->get_line_metrics(font->font_data, &line_metrics);
+   line_height = line_metrics->height * scale / VIDEO_SCALE_H(gl->vp.dims);
 
    for (n = 0; n < 6; n++)
    {
@@ -888,96 +870,50 @@ static void gl1_raster_font_render_line(gl1_t *gl,
       color_block[4 * n + 3] = color[3];
    }
 
-   while (msg < msg_end)
-   {
-      i = 0;
-      while ((i < MAX_MSG_LEN_CHUNK) && (msg < msg_end))
-      {
-         const struct font_glyph *glyph;
-         int off_x, off_y, tex_x, tex_y, width, height;
-         unsigned                  code = utf8_walk(&msg);
-
-         /* Do something smarter here ... */
-         if (!(glyph = get_glyph(font_data, code)))
-            if (!(glyph = glyph_q))
-               continue;
-
-         off_x  = glyph->draw_offset_x;
-         off_y  = glyph->draw_offset_y;
-         tex_x  = glyph->atlas_offset_x;
-         tex_y  = glyph->atlas_offset_y;
-         width  = glyph->width;
-         height = glyph->height;
-
-         GL1_RASTER_FONT_EMIT(0, 0, 1); /* Bottom-left */
-         GL1_RASTER_FONT_EMIT(1, 1, 1); /* Bottom-right */
-         GL1_RASTER_FONT_EMIT(2, 0, 0); /* Top-left */
-
-         GL1_RASTER_FONT_EMIT(3, 1, 0); /* Top-right */
-         GL1_RASTER_FONT_EMIT(4, 0, 0); /* Top-left */
-         GL1_RASTER_FONT_EMIT(5, 1, 1); /* Bottom-right */
-
-         memcpy(&font_color[4 * 6 * i], color_block,
-               sizeof(color_block));
-
-         i++;
-
-         delta_x += glyph->advance_x;
-         delta_y -= glyph->advance_y;
-      }
-
-      coords.tex_coord     = font_tex_coords;
-      coords.vertex        = font_vertex;
-      coords.color         = font_color;
-      coords.vertices      = i * 6;
-      coords.lut_tex_coord = NULL;
-
-      if (font->block)
-         video_coord_array_append(&font->block->carr, &coords, coords.vertices);
-      else
-         gl1_raster_font_draw_vertices(gl, font, &coords);
-   }
+#define FONT_LAYOUT_ALIGNED aligned
+#define FONT_LAYOUT_LINE(line, line_width, count, bytes) \
+   do \
+   { \
+      (void)(count); \
+      x = pre_x; \
+      y = roundf((pos_y - (float)(line) * line_height) \
+            * VIDEO_SCALE_H(gl->vp.dims)); \
+      if (text_align == TEXT_ALIGN_RIGHT) \
+         x -= (int)((line_width) * scale); \
+      else if (text_align == TEXT_ALIGN_CENTER) \
+         x -= (int)((line_width) * scale) / 2; \
+   } while (0)
+#define FONT_LAYOUT_GLYPH(glyph, pen_x, pen_y) \
+   do \
+   { \
+      int off_x   = (glyph)->draw_offset_x; \
+      int off_y   = (glyph)->draw_offset_y; \
+      int tex_x   = (glyph)->atlas_offset_x; \
+      int tex_y   = (glyph)->atlas_offset_y; \
+      int width   = (glyph)->width; \
+      int height  = (glyph)->height; \
+      int delta_x = (pen_x); \
+      int delta_y = -(pen_y); \
+      GL1_RASTER_FONT_EMIT(0, 0, 1); /* Bottom-left */ \
+      GL1_RASTER_FONT_EMIT(1, 1, 1); /* Bottom-right */ \
+      GL1_RASTER_FONT_EMIT(2, 0, 0); /* Top-left */ \
+      GL1_RASTER_FONT_EMIT(3, 1, 0); /* Top-right */ \
+      GL1_RASTER_FONT_EMIT(4, 0, 0); /* Top-left */ \
+      GL1_RASTER_FONT_EMIT(5, 1, 1); /* Bottom-right */ \
+      memcpy(&font_color[4 * 6 * i], color_block, sizeof(color_block)); \
+      if (++i == MAX_MSG_LEN_CHUNK) \
+         GL1_RASTER_FONT_FLUSH(); \
+   } while (0)
+#define FONT_LAYOUT_LINE_END() \
+   do \
+   { \
+      if (i) \
+         GL1_RASTER_FONT_FLUSH(); \
+   } while (0)
+#include "../font_layout.h"
 }
 
-static void gl1_raster_font_render_message(gl1_t *gl,
-      gl1_raster_t *font, const char *msg, GLfloat scale,
-      const GLfloat color[4], GLfloat pos_x, GLfloat pos_y,
-      float inv_tex_size_x,
-      float inv_tex_size_y,
-      float inv_win_width,
-      float inv_win_height,
-      unsigned text_align)
-{
-   float line_height;
-   struct font_line_metrics *line_metrics = NULL;
-   int lines                              = 0;
-   const struct font_glyph* glyph_q       = font->font_driver->get_glyph(font->font_data, '?');
-   int x                                  = roundf(pos_x * VIDEO_SCALE_W(gl->vp.dims));
-   font->font_driver->get_line_metrics(font->font_data, &line_metrics);
-   line_height = line_metrics->height * scale / VIDEO_SCALE_H(gl->vp.dims);
-   for (;;)
-   {
-      size_t msg_len;
-      const char *p = msg;
-      while (*p && *p != '\n')
-         p++;
-      msg_len = p - msg;
-      /* Draw the line */
-      gl1_raster_font_render_line(gl, font, glyph_q,
-            msg, msg_len, scale, color, pos_x,
-            pos_y - (float)lines*line_height,
-            x,
-            inv_tex_size_x,
-            inv_tex_size_y,
-            inv_win_width,
-            inv_win_height,
-            text_align);
-      if (!*p)
-         break;
-      msg = p + 1;
-      lines++;
-   }
-}
+#undef GL1_RASTER_FONT_FLUSH
 
 static void gl1_raster_font_setup_viewport(
       gl1_t *gl,
@@ -997,6 +933,7 @@ static void gl1_raster_font_render_msg(
       const char *msg, size_t msg_len,
       const struct font_params *params)
 {
+   font_params_resolved_t rp;
    GLfloat color[4];
    int drop_x, drop_y;
    GLfloat x, y, scale, drop_mod, drop_alpha;
@@ -1008,51 +945,37 @@ static void gl1_raster_font_render_msg(
    if (!font || !msg || !*msg || !gl)
       return;
 
-   if (params)
+   /* Asked for before anything is laid out: it may have grown, and the
+    * texture coordinates are taken from the texture's size */
+   font->atlas = font->font_driver->get_atlas(font->font_data);
    {
-      x           = params->x;
-      y           = params->y;
-      scale       = params->scale;
-      full_screen = params->full_screen;
-      text_align  = params->text_align;
-      drop_x      = params->drop_x;
-      drop_y      = params->drop_y;
-      drop_mod    = params->drop_mod;
-      drop_alpha  = params->drop_alpha;
-
-      color[0]    = FONT_COLOR_GET_RED(params->color)   / 255.0f;
-      color[1]    = FONT_COLOR_GET_GREEN(params->color) / 255.0f;
-      color[2]    = FONT_COLOR_GET_BLUE(params->color)  / 255.0f;
-      color[3]    = FONT_COLOR_GET_ALPHA(params->color) / 255.0f;
-
-      /* If alpha is 0.0f, turn it into default 1.0f */
-      if (color[3] <= 0.0f)
-         color[3] = 1.0f;
+      unsigned tex_dims = VIDEO_SCALE_PACK(next_pow2(font->atlas->width),
+            next_pow2(font->atlas->height));
+      if (tex_dims != font->tex_dims)
+      {
+         font->tex_dims  = tex_dims;
+         font->respecify = true;
+      }
    }
-   else
-   {
-      settings_t *settings    = config_get_ptr();
-      float video_msg_pos_x   = settings->floats.video_msg_pos_x;
-      float video_msg_pos_y   = settings->floats.video_msg_pos_y;
-      float video_msg_color_r = settings->floats.video_msg_color_r;
-      float video_msg_color_g = settings->floats.video_msg_color_g;
-      float video_msg_color_b = settings->floats.video_msg_color_b;
-      x                       = video_msg_pos_x;
-      y                       = video_msg_pos_y;
-      scale                   = 1.0f;
-      full_screen             = true;
-      text_align              = TEXT_ALIGN_LEFT;
 
-      color[0]                = video_msg_color_r;
-      color[1]                = video_msg_color_g;
-      color[2]                = video_msg_color_b;
-      color[3]                = 1.0f;
+   font_driver_resolve_params(params, &rp);
+   x           = rp.x;
+   y           = rp.y;
+   scale       = rp.scale;
+   full_screen = rp.full_screen;
+   text_align  = rp.text_align;
+   drop_x      = rp.drop_x;
+   drop_y      = rp.drop_y;
+   drop_mod    = rp.drop_mod;
+   drop_alpha  = rp.drop_alpha;
+   color[0]    = rp.color[0];
+   color[1]    = rp.color[1];
+   color[2]    = rp.color[2];
+   color[3]    = rp.color[3];
+   /* If alpha is 0.0f, turn it into default 1.0f */
+   if (color[3] <= 0.0f)
+      color[3] = 1.0f;
 
-      drop_x                  = -2;
-      drop_y                  = -2;
-      drop_mod                = 0.3f;
-      drop_alpha              = 1.0f;
-   }
 
    if (font->block)
       font->block->fullscreen = full_screen;
@@ -1090,7 +1013,8 @@ static void gl1_raster_font_render_msg(
             color_dark[2] = color[2] * drop_mod;
             color_dark[3] = color[3] * drop_alpha;
 
-            gl1_raster_font_render_message(gl, font, msg, scale, color_dark,
+            gl1_raster_font_render_message(gl, font, msg, msg_len, scale,
+                  color_dark,
                   x + scale * drop_x / VIDEO_SCALE_W(gl->vp.dims),
                   y + scale * drop_y / VIDEO_SCALE_H(gl->vp.dims),
                   inv_tex_size_x,
@@ -1100,7 +1024,8 @@ static void gl1_raster_font_render_msg(
                   text_align);
          }
 
-         gl1_raster_font_render_message(gl, font, msg, scale, color,
+         gl1_raster_font_render_message(gl, font, msg, msg_len, scale,
+               color,
                x, y,
                inv_tex_size_x,
                inv_tex_size_y,

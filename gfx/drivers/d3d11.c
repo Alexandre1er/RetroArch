@@ -401,7 +401,22 @@ typedef struct
    D3D11BlendState       blend_enable;
    D3D11BlendState       blend_disable;
    D3D11BlendState       blend_pipeline;
-   D3D11Buffer           menu_pipeline_vbo;
+   /* gfx_display meshes: the shader and constant buffer they draw with,
+    * and each mesh's own buffers by mesh id. The one drawn longest ago
+    * gives way when all are taken; the runtime keeps a released buffer
+    * alive for as long as queued work uses it. */
+   /* The menu effects tried so far, one bit each */
+   unsigned              effects_tried;
+   d3d11_shader_t        mesh_shader;
+   D3D11Buffer           mesh_ubo;
+   struct
+   {
+      D3D11Buffer vbo;
+      D3D11Buffer ibo;
+      uint64_t    last_draw;
+      uint32_t    id;
+   } meshes[8];
+   uint64_t              mesh_draws;
    math_matrix_4x4       mvp, mvp_last_pass, mvp_no_rot, identity;
    struct video_viewport vp;
    D3D11_VIEWPORT        viewport;
@@ -841,6 +856,82 @@ static void gfx_display_d3d11_blend_end(void *data)
    d3d11->context->lpVtbl->OMSetBlendState(d3d11->context, d3d11->blend_disable, NULL, D3D11_DEFAULT_SAMPLE_MASK);
 }
 
+/* A menu effect's shaders, compiled the first time the effect is drawn
+ * rather than all six at start: at most one is ever on screen, and the
+ * effects are no longer XMB's alone. False when they cannot be had, and
+ * the effect is not drawn; one that will not compile is not tried again
+ * until the driver is. */
+static bool d3d11_effect_shader(d3d11_video_t *d3d11, unsigned pipeline_id)
+{
+   static const D3D11_INPUT_ELEMENT_DESC ribbon_desc[] = {
+      { "POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+   };
+   static const D3D11_INPUT_ELEMENT_DESC quad_desc[] = {
+      { "POSITION", 0, DXGI_FORMAT_R32G32_FLOAT,
+         0, offsetof(d3d11_vertex_t, position), D3D11_INPUT_PER_VERTEX_DATA, 0 },
+      { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT,
+         0, offsetof(d3d11_vertex_t, texcoord), D3D11_INPUT_PER_VERTEX_DATA, 0 },
+   };
+   static const char ribbon[] =
+#include "d3d_shaders/ribbon_sm4.hlsl.h"
+      ;
+   static const char ribbon_simple[] =
+#include "d3d_shaders/ribbon_simple_sm4.hlsl.h"
+      ;
+   static const char simple_snow[] =
+#include "d3d_shaders/simple_snow_sm4.hlsl.h"
+      ;
+   static const char snow[] =
+#include "d3d_shaders/snow_sm4.hlsl.h"
+      ;
+   static const char bokeh[] =
+#include "d3d_shaders/bokeh_sm4.hlsl.h"
+      ;
+   static const char snowflake[] =
+#include "d3d_shaders/snowflake_sm4.hlsl.h"
+      ;
+   const char *src                         = NULL;
+   size_t size                             = 0;
+   const D3D11_INPUT_ELEMENT_DESC *desc    = quad_desc;
+   UINT count                              = countof(quad_desc);
+   unsigned bit;
+
+   switch (pipeline_id)
+   {
+      case VIDEO_SHADER_MENU:
+         src = ribbon;        size = sizeof(ribbon);        bit = 1 << 0;
+         desc = ribbon_desc;  count = countof(ribbon_desc);
+         break;
+      case VIDEO_SHADER_MENU_2:
+         src = ribbon_simple; size = sizeof(ribbon_simple); bit = 1 << 1;
+         desc = ribbon_desc;  count = countof(ribbon_desc);
+         break;
+      case VIDEO_SHADER_MENU_3:
+         src = simple_snow;   size = sizeof(simple_snow);   bit = 1 << 2;
+         break;
+      case VIDEO_SHADER_MENU_4:
+         src = snow;          size = sizeof(snow);          bit = 1 << 3;
+         break;
+      case VIDEO_SHADER_MENU_5:
+         src = bokeh;         size = sizeof(bokeh);         bit = 1 << 4;
+         break;
+      case VIDEO_SHADER_MENU_6:
+         src = snowflake;     size = sizeof(snowflake);     bit = 1 << 5;
+         break;
+      default:
+         return false;
+   }
+   if (d3d11->shaders[pipeline_id].vs)
+      return true;
+   if (d3d11->effects_tried & bit)
+      return false;
+   d3d11->effects_tried |= bit;
+   return d3d11_init_shader(d3d11->device, src, size, NULL,
+            "VSMain", "PSMain", NULL, desc, count,
+            &d3d11->shaders[pipeline_id],
+            D3D11_FEATURE_LEVEL_HINT_DONTCARE);
+}
+
 static void gfx_display_d3d11_draw(gfx_display_ctx_draw_t *draw,
       void *data, unsigned video_dims)
 {
@@ -858,6 +949,9 @@ static void gfx_display_d3d11_draw(gfx_display_ctx_draw_t *draw,
       case VIDEO_SHADER_MENU_4:
       case VIDEO_SHADER_MENU_5:
       case VIDEO_SHADER_MENU_6:
+         /* Compiled by the pipeline call before this, or not at all */
+         if (!d3d11->shaders[draw->pipeline_id].vs)
+            return;
          {
             d3d11_shader_t *shader = &d3d11->shaders[draw->pipeline_id];
             d3d11->context->lpVtbl->IASetInputLayout(d3d11->context, shader->layout);
@@ -1003,6 +1097,158 @@ static void gfx_display_d3d11_draw(gfx_display_ctx_draw_t *draw,
    }
 }
 
+/* The slot whose buffers hold @mesh, made the first time it is drawn;
+ * -1 when they cannot be had, and the mesh is streamed */
+static int d3d11_mesh_slot(d3d11_video_t *d3d11,
+      const gfx_display_mesh_t *mesh)
+{
+   D3D11_BUFFER_DESC desc;
+   D3D11_SUBRESOURCE_DATA data;
+   uint64_t oldest = (uint64_t)-1;
+   int slot        = -1;
+   unsigned i;
+
+   for (i = 0; i < ARRAY_SIZE(d3d11->meshes); i++)
+   {
+      if (d3d11->meshes[i].vbo && d3d11->meshes[i].id == mesh->id)
+         return (int)i;
+      if (!d3d11->meshes[i].vbo)
+      {
+         if (slot < 0 || d3d11->meshes[slot].vbo)
+            slot = (int)i;
+      }
+      else if ((slot < 0 || d3d11->meshes[slot].vbo)
+            && d3d11->meshes[i].last_draw < oldest)
+      {
+         oldest = d3d11->meshes[i].last_draw;
+         slot   = (int)i;
+      }
+   }
+   if (slot < 0)
+      return -1;
+   Release(d3d11->meshes[slot].vbo);
+   Release(d3d11->meshes[slot].ibo);
+   d3d11->meshes[slot].id = 0;
+
+   desc.Usage               = D3D11_USAGE_IMMUTABLE;
+   desc.ByteWidth           = mesh->vertex_count * sizeof(gfx_display_mesh_vertex_t);
+   desc.BindFlags           = D3D11_BIND_VERTEX_BUFFER;
+   desc.CPUAccessFlags      = 0;
+   desc.MiscFlags           = 0;
+   desc.StructureByteStride = 0;
+   data.pSysMem             = mesh->vertices;
+   data.SysMemPitch         = 0;
+   data.SysMemSlicePitch    = 0;
+   if (FAILED(d3d11->device->lpVtbl->CreateBuffer(d3d11->device, &desc, &data,
+               &d3d11->meshes[slot].vbo)))
+   {
+      d3d11->meshes[slot].vbo = NULL;
+      return -1;
+   }
+   if (mesh->indices)
+   {
+      desc.ByteWidth = mesh->index_count * sizeof(uint16_t);
+      desc.BindFlags = D3D11_BIND_INDEX_BUFFER;
+      data.pSysMem   = mesh->indices;
+      if (FAILED(d3d11->device->lpVtbl->CreateBuffer(d3d11->device, &desc, &data,
+                  &d3d11->meshes[slot].ibo)))
+      {
+         d3d11->meshes[slot].ibo = NULL;
+         Release(d3d11->meshes[slot].vbo);
+         return -1;
+      }
+   }
+   d3d11->meshes[slot].id = mesh->id;
+   return slot;
+}
+
+static bool gfx_display_d3d11_mesh_draw(void *data, unsigned video_dims,
+      const gfx_display_mesh_t *mesh, const float *mvp,
+      uintptr_t texture, const float *tint)
+{
+   /* The vertex stage's constant buffer: a float4x4, then a float4 */
+   struct
+   {
+      math_matrix_4x4 mvp;
+      float tint[4];
+   } ubo;
+   math_matrix_4x4 user;
+   D3D11_MAPPED_SUBRESOURCE mapped;
+   D3D11BlendState blend    = NULL;
+   FLOAT blend_factor[4];
+   UINT sample_mask         = 0;
+   UINT stride              = sizeof(gfx_display_mesh_vertex_t);
+   UINT offset              = 0;
+   d3d11_video_t *d3d11     = (d3d11_video_t*)data;
+   d3d11_texture_t *tex     = (d3d11_texture_t*)texture;
+   D3D11DeviceContext ctx;
+   int slot;
+
+   (void)video_dims;
+   if (     !d3d11 || !mesh || !tex || !d3d11->mesh_ubo
+         || !d3d11->mesh_shader.vs || !d3d11->mesh_shader.ps)
+      return false;
+   if ((slot = d3d11_mesh_slot(d3d11, mesh)) < 0)
+      return false;
+   d3d11->meshes[slot].last_draw = ++d3d11->mesh_draws;
+   ctx = d3d11->context;
+
+   /* Through the same MVP the quads go through, so the display's 0..1
+    * space lands where theirs does */
+   memcpy(user.data, mvp, sizeof(user.data));
+   matrix_4x4_multiply(ubo.mvp, d3d11->ubo_values.mvp, user);
+   memcpy(ubo.tint, tint, sizeof(ubo.tint));
+   if (FAILED(ctx->lpVtbl->Map(ctx, (D3D11Resource)d3d11->mesh_ubo, 0,
+               D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
+      return false;
+   memcpy(mapped.pData, &ubo, sizeof(ubo));
+   ctx->lpVtbl->Unmap(ctx, (D3D11Resource)d3d11->mesh_ubo, 0);
+
+   /* Meshes are drawn blended, as every driver draws them */
+   ctx->lpVtbl->OMGetBlendState(ctx, &blend, blend_factor, &sample_mask);
+   ctx->lpVtbl->OMSetBlendState(ctx, d3d11->blend_enable, NULL,
+         D3D11_DEFAULT_SAMPLE_MASK);
+
+   ctx->lpVtbl->IASetInputLayout(ctx, d3d11->mesh_shader.layout);
+   ctx->lpVtbl->VSSetShader(ctx, d3d11->mesh_shader.vs, NULL, 0);
+   ctx->lpVtbl->PSSetShader(ctx, d3d11->mesh_shader.ps, NULL, 0);
+   ctx->lpVtbl->GSSetShader(ctx, NULL, NULL, 0);
+   ctx->lpVtbl->VSSetConstantBuffers(ctx, 0, 1, &d3d11->mesh_ubo);
+   ctx->lpVtbl->PSSetShaderResources(ctx, 0, 1, &tex->view);
+   ctx->lpVtbl->PSSetSamplers(ctx, 0, 1, (D3D11SamplerState*)&tex->sampler);
+   ctx->lpVtbl->IASetVertexBuffers(ctx, 0, 1, &d3d11->meshes[slot].vbo,
+         &stride, &offset);
+   ctx->lpVtbl->IASetPrimitiveTopology(ctx,
+         mesh->topology == GFX_MESH_TRIANGLE_STRIP
+         ? D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP
+         : D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+   if (mesh->indices)
+   {
+      ctx->lpVtbl->IASetIndexBuffer(ctx, d3d11->meshes[slot].ibo,
+            DXGI_FORMAT_R16_UINT, 0);
+      ctx->lpVtbl->DrawIndexed(ctx, mesh->index_count, 0, 0);
+   }
+   else
+      ctx->lpVtbl->Draw(ctx, mesh->vertex_count, 0);
+
+   /* Back to what the quads after this one draw with */
+   ctx->lpVtbl->OMSetBlendState(ctx, blend, blend_factor, sample_mask);
+   Release(blend);
+   ctx->lpVtbl->VSSetConstantBuffers(ctx, 0, 1, &d3d11->ubo);
+   {
+      d3d11_shader_t *shader = d3d11_sprite_shader(d3d11);
+      UINT sprite_stride     = sizeof(d3d11_sprite_t);
+      ctx->lpVtbl->IASetInputLayout(ctx, shader->layout);
+      ctx->lpVtbl->VSSetShader(ctx, shader->vs, NULL, 0);
+      ctx->lpVtbl->PSSetShader(ctx, shader->ps, NULL, 0);
+      ctx->lpVtbl->GSSetShader(ctx, shader->gs, NULL, 0);
+      ctx->lpVtbl->IASetVertexBuffers(ctx, 0, 1, &d3d11->sprites.vbo,
+            &sprite_stride, &offset);
+   }
+   ctx->lpVtbl->IASetPrimitiveTopology(ctx, D3D11_PRIMITIVE_TOPOLOGY_POINTLIST);
+   return true;
+}
+
 static void gfx_display_d3d11_draw_pipeline(gfx_display_ctx_draw_t *draw,
       gfx_display_t *p_disp,
       void *data, unsigned video_dims)
@@ -1011,47 +1257,35 @@ static void gfx_display_d3d11_draw_pipeline(gfx_display_ctx_draw_t *draw,
 
    if (!d3d11 || !draw)
       return;
+   /* Before anything is bound for it */
+   if (!d3d11_effect_shader(d3d11, draw->pipeline_id))
+      return;
 
    switch (draw->pipeline_id)
    {
       case VIDEO_SHADER_MENU:
       case VIDEO_SHADER_MENU_2:
+      if (p_disp->effect_mesh)
       {
-         video_coord_array_t* ca   = &p_disp->dispca;
-
-         if (!d3d11->menu_pipeline_vbo)
-         {
-            D3D11_BUFFER_DESC desc;
-            desc.Usage               = D3D11_USAGE_IMMUTABLE;
-            desc.ByteWidth           = ca->coords.vertices * 2 * sizeof(float);
-            desc.BindFlags           = D3D11_BIND_VERTEX_BUFFER;
-            desc.CPUAccessFlags      = 0;
-            desc.MiscFlags           = 0;
-            desc.StructureByteStride = 0;
-
-            {
-               D3D11_SUBRESOURCE_DATA vertex_data;
-               vertex_data.pSysMem          = ca->coords.vertex;
-               vertex_data.SysMemPitch      = 0;
-               vertex_data.SysMemSlicePitch = 0;
-               d3d11->device->lpVtbl->CreateBuffer(
-                     d3d11->device, &desc, &vertex_data,
-                     &d3d11->menu_pipeline_vbo);
-            }
-         }
-         {
-            UINT stride = 2 * sizeof(float);
-            UINT offset = 0;
-            d3d11->context->lpVtbl->IASetVertexBuffers(
-                  d3d11->context, 0, 1,
-                  &d3d11->menu_pipeline_vbo, &stride, &offset);
-         }
-         draw->coords->vertices = ca->coords.vertices;
+         /* From the ribbon mesh's own buffer, its position only */
+         const gfx_display_mesh_t *mesh = p_disp->effect_mesh;
+         int slot = d3d11_mesh_slot(d3d11, mesh);
+         UINT stride = sizeof(gfx_display_mesh_vertex_t);
+         UINT offset = 0;
+         if (slot < 0)
+            return;
+         d3d11->meshes[slot].last_draw = ++d3d11->mesh_draws;
+         d3d11->context->lpVtbl->IASetVertexBuffers(
+               d3d11->context, 0, 1,
+               &d3d11->meshes[slot].vbo, &stride, &offset);
+         draw->coords->vertices = mesh->vertex_count;
          d3d11->context->lpVtbl->OMSetBlendState(
                d3d11->context, d3d11->blend_pipeline,
                NULL, D3D11_DEFAULT_SAMPLE_MASK);
          break;
       }
+      /* Nothing to draw it from */
+      return;
 
       case VIDEO_SHADER_MENU_3:
       case VIDEO_SHADER_MENU_4:
@@ -1073,12 +1307,9 @@ static void gfx_display_d3d11_draw_pipeline(gfx_display_ctx_draw_t *draw,
    d3d11->context->lpVtbl->IASetPrimitiveTopology(
          d3d11->context, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
 
-   d3d11->ubo_values.time += 0.01f;
-   /* Wrap at 65536 to keep fp32 increments precise. 0.01 stays
-    * exactly representable up to t ~ 167772 (where 0.5*ulp first
-    * exceeds 0.01), so 65536 has wide margin and wraps roughly
-    * every 30 h of cumulative menu time, making the discontinuity
-    * effectively unobservable. */
+   /* The effects' clock, one step ahead, as this driver has always
+    * drawn them */
+   d3d11->ubo_values.time = p_disp->effect_time + 0.01f;
    if (d3d11->ubo_values.time > 65536.0f)
       d3d11->ubo_values.time -= 65536.0f;
 
@@ -1154,6 +1385,35 @@ static void d3d11_font_update_atlas_region(
       D3D11DeviceContext ctx, d3d11_font_t *font,
       unsigned x0, unsigned y0, unsigned x1, unsigned y1);
 
+/* (Re)makes the font texture at the atlas's size and uploads all of
+ * it: at init, and when the atlas has grown. The context keeps a
+ * released texture alive for draws already recorded against it. */
+static void d3d11_font_make_texture(d3d11_video_t *d3d11,
+      d3d11_font_t *font)
+{
+   font->texture.sampler     = d3d11->samplers[RARCH_FILTER_LINEAR][RARCH_WRAP_BORDER];
+   font->texture.desc.Width  = font->atlas->width;
+   font->texture.desc.Height = font->atlas->height;
+   font->texture.desc.Format = (font->atlas->format == FONT_ATLAS_FORMAT_A16)
+         ? DXGI_FORMAT_R16_UNORM : DXGI_FORMAT_A8_UNORM;
+   d3d11_release_texture(&font->texture);
+   d3d11_init_texture(d3d11->device, &font->texture);
+   if (font->texture.staging)
+   {
+      if (font->atlas->format == FONT_ATLAS_FORMAT_A16)
+         /* the generic path's conversion table does not cover R16;
+          * stage the whole atlas through the element-size-aware
+          * region helper instead */
+         d3d11_font_update_atlas_region(d3d11->context, font,
+               0, 0, font->atlas->width, font->atlas->height);
+      else
+         d3d11_update_texture(
+               d3d11->context, font->atlas->width, font->atlas->height, font->atlas->width,
+               DXGI_FORMAT_A8_UNORM, font->atlas->buffer, &font->texture);
+   }
+   font->atlas->dirty = false;
+}
+
 static void * d3d11_font_init(void* data, const char* font_path,
       float font_size, bool is_threaded)
 {
@@ -1180,27 +1440,20 @@ static void * d3d11_font_init(void* data, const char* font_path,
 
    font->d3d11               = d3d11;
    font->atlas               = font->font_driver->get_atlas(font->font_data);
-   font->texture.sampler     = d3d11->samplers[RARCH_FILTER_LINEAR][RARCH_WRAP_BORDER];
-   font->texture.desc.Width  = font->atlas->width;
-   font->texture.desc.Height = font->atlas->height;
-   font->texture.desc.Format = (font->atlas->format == FONT_ATLAS_FORMAT_A16)
-         ? DXGI_FORMAT_R16_UNORM : DXGI_FORMAT_A8_UNORM;
-   d3d11_release_texture(&font->texture);
-   d3d11_init_texture(d3d11->device, &font->texture);
-   if (font->texture.staging)
+   /* The atlas may grow, up to the largest 2D texture the feature
+    * level guarantees */
    {
-      if (font->atlas->format == FONT_ATLAS_FORMAT_A16)
-         /* the generic path's conversion table does not cover R16;
-          * stage the whole atlas through the element-size-aware
-          * region helper instead */
-         d3d11_font_update_atlas_region(d3d11->context, font,
-               0, 0, font->atlas->width, font->atlas->height);
-      else
-         d3d11_update_texture(
-               d3d11->context, font->atlas->width, font->atlas->height, font->atlas->width,
-               DXGI_FORMAT_A8_UNORM, font->atlas->buffer, &font->texture);
+      unsigned max_tex = 2048;
+      if (d3d11->supportedFeatureLevel >= D3D_FEATURE_LEVEL_11_0)
+         max_tex = 16384;
+      else if (d3d11->supportedFeatureLevel >= D3D_FEATURE_LEVEL_10_0)
+         max_tex = 8192;
+      else if (d3d11->supportedFeatureLevel >= D3D_FEATURE_LEVEL_9_3)
+         max_tex = 4096;
+      font->atlas->max_width  = max_tex;
+      font->atlas->max_height = max_tex;
    }
-   font->atlas->dirty = false;
+   d3d11_font_make_texture(d3d11, font);
 
    return font;
 }
@@ -1222,40 +1475,14 @@ static void d3d11_font_free(void* data, bool is_threaded)
    free(font);
 }
 
-static int d3d11_font_get_message_width(void* data, const char* msg, size_t msg_len, float scale)
+static int d3d11_font_get_message_width(void *data, const char *msg,
+      size_t msg_len, float scale)
 {
-   size_t i;
-   int delta_x                      = 0;
-   const struct font_glyph* glyph_q = NULL;
-   d3d11_font_t* font               = (d3d11_font_t*)data;
-   const struct font_glyph* (*get_glyph)(void*, uint32_t)
-                                    = font->font_driver->get_glyph;
-   void *font_data                  = font->font_data;
-
+   d3d11_font_t *font = (d3d11_font_t*)data;
    if (!font)
       return 0;
-
-   glyph_q = get_glyph(font_data, '?');
-
-   for (i = 0; i < msg_len; i++)
-   {
-      const struct font_glyph *glyph;
-      const char* msg_tmp = &msg[i];
-      unsigned    code    = utf8_walk(&msg_tmp);
-      unsigned    skip    = msg_tmp - &msg[i];
-
-      if (skip > 1)
-         i += skip - 1;
-
-      /* Do something smarter here ... */
-      if (!(glyph = get_glyph(font_data, code)))
-         if (!(glyph = glyph_q))
-            continue;
-
-      delta_x += glyph->advance_x;
-   }
-
-   return delta_x * scale;
+   return font_renderer_get_message_width(font->font_driver,
+         font->font_data, msg, msg_len, scale);
 }
 
 /* Update only the atlas dirty rectangle of the A8 font texture:
@@ -1315,6 +1542,7 @@ static void d3d11_font_render_msg(
       const char* msg, size_t msg_len,
       const struct font_params *params)
 {
+   font_params_resolved_t rp;
    float line_height;
    int drop_x, drop_y;
    struct font_line_metrics *line_metrics = NULL;
@@ -1345,48 +1573,31 @@ static void d3d11_font_render_msg(
    if (!(d3d11->flags & D3D11_ST_FLAG_SPRITES_ENABLE))
       return;
 
-   if (params)
+   /* Asked for before anything is laid out: it may have grown, and the
+    * texture coordinates are taken from the texture's size */
+   if (font->font_driver && font->font_data)
    {
-      x                       = params->x;
-      y                       = params->y;
-      scale                   = params->scale;
-      text_align              = params->text_align;
-      drop_x                  = params->drop_x;
-      drop_y                  = params->drop_y;
-      drop_mod                = params->drop_mod;
-      drop_alpha              = params->drop_alpha;
-
-      r                       = FONT_COLOR_GET_RED(params->color);
-      g                       = FONT_COLOR_GET_GREEN(params->color);
-      b                       = FONT_COLOR_GET_BLUE(params->color);
-      alpha                   = FONT_COLOR_GET_ALPHA(params->color);
-
-      color                   = DXGI_COLOR_RGBA(r, g, b, alpha);
+      font->atlas = font->font_driver->get_atlas(font->font_data);
+      if (     font->texture.desc.Width  != font->atlas->width
+            || font->texture.desc.Height != font->atlas->height)
+         d3d11_font_make_texture(d3d11, font);
    }
-   else
-   {
-      settings_t *settings    = config_get_ptr();
-      float video_msg_color_r = settings->floats.video_msg_color_r;
-      float video_msg_color_g = settings->floats.video_msg_color_g;
-      float video_msg_color_b = settings->floats.video_msg_color_b;
-      float video_msg_pos_x   = settings->floats.video_msg_pos_x;
-      float video_msg_pos_y   = settings->floats.video_msg_pos_y;
-      x                       = video_msg_pos_x;
-      y                       = video_msg_pos_y;
-      scale                   = 1.0f;
-      text_align              = TEXT_ALIGN_LEFT;
 
-      r                       = (video_msg_color_r * 255);
-      g                       = (video_msg_color_g * 255);
-      b                       = (video_msg_color_b * 255);
-      alpha                   = 255;
-      color                   = DXGI_COLOR_RGBA(r, g, b, alpha);
+   font_driver_resolve_params(params, &rp);
+   x          = rp.x;
+   y          = rp.y;
+   scale      = rp.scale;
+   text_align = rp.text_align;
+   drop_x     = rp.drop_x;
+   drop_y     = rp.drop_y;
+   drop_mod   = rp.drop_mod;
+   drop_alpha = rp.drop_alpha;
+   r          = rp.rgba[0];
+   g          = rp.rgba[1];
+   b          = rp.rgba[2];
+   alpha           = rp.rgba[3];
+   color      = DXGI_COLOR_RGBA(r, g, b, alpha);
 
-      drop_x                  = -2;
-      drop_y                  = -2;
-      drop_mod                = 0.3f;
-      drop_alpha              = 1.0f;
-   }
 
    get_glyph                  = font->font_driver->get_glyph;
    font_data                  = font->font_data;
@@ -1484,184 +1695,133 @@ static void d3d11_font_render_msg(
 
    v = (d3d11_sprite_t*)mapped_vbo.pData + start_offset;
 
-   /* Prepare a sprite template for the constant fields.
-    * params.scaling (1.0f) and params.rotation (0.0f) are identical for
-    * every glyph; colors are identical within a pass.  We memcpy this
-    * template per glyph instead of doing 6 individual stores. */
-
-   /* Single-pass emit: walk the message once, emitting
-    * shadow + foreground glyphs together per line.
-    *
-    * For RIGHT/CENTER alignment, emit glyphs at the base lx
-    * first, then retroactively shift pos.x for the line.  This fuses
-    * the measurement and emit passes — each glyph is looked up once. */
+   /* Each line's shadow sprites go ahead of its glyph sprites, so the
+    * shadows draw behind the text. With a shadow the line is measured
+    * first: knowing its glyph count, every sprite is written straight
+    * to its slot - shadow k at v_line + k, glyph k at v_line + n + k.
+    * Right and centred lines are shifted once their advance is known,
+    * and their shadows taken from the shifted glyphs. */
    {
-      const char *line_start = msg;
-      int lines              = 0;
+      d3d11_sprite_t *v_line = v;
+      unsigned n             = 0;
+      unsigned k             = 0;
+      bool line_ok           = false;
+      int lx                 = base_lx;
+      int fg_ly              = 0;
+      int fx                 = 0;
+      int fy                 = 0;
+      int sx                 = 0;
+      int sy                 = 0;
       int capacity           = font->block
          ? (int)(font->acc_cap - start_offset) : d3d11->sprites.capacity;
       bool need_align        = (text_align == TEXT_ALIGN_RIGHT
                                  || text_align == TEXT_ALIGN_CENTER);
 
-      for (;;)
-      {
-         const char *delim   = line_start;
-         const char *line_end;
-         size_t line_len;
+#define D3D11_FONT_SPRITE(dst, px, py, glyph, col) \
+      do \
+      { \
+         (dst)->pos.x           = ((px) + (glyph)->draw_offset_x * scale) * inv_vp_w; \
+         (dst)->pos.y           = ((py) + (glyph)->draw_offset_y * scale) * inv_vp_h; \
+         (dst)->pos.w           = (glyph)->width  * scale_inv_vp_w; \
+         (dst)->pos.h           = (glyph)->height * scale_inv_vp_h; \
+         (dst)->coords.u        = (glyph)->atlas_offset_x * inv_tex_w; \
+         (dst)->coords.v        = (glyph)->atlas_offset_y * inv_tex_h; \
+         (dst)->coords.w        = (glyph)->width  * inv_tex_w; \
+         (dst)->coords.h        = (glyph)->height * inv_tex_h; \
+         (dst)->params.scaling  = 1; \
+         (dst)->params.rotation = 0; \
+         (dst)->colors[0]       = (col); \
+         (dst)->colors[1]       = (col); \
+         (dst)->colors[2]       = (col); \
+         (dst)->colors[3]       = (col); \
+      } while (0)
 
-         while (*delim && *delim != '\n')
-            delim++;
-         line_len = (size_t)(delim - line_start);
-         line_end = line_start + line_len;
-
-         if (line_len > 0 && line_len <= (unsigned)capacity)
-         {
-            float fg_pos_y  = y - (float)lines * line_height;
-            int   fg_ly     = (int)roundf((1.0f - fg_pos_y) * height);
-            int   lx        = base_lx;
-
-            /* Emit shadow glyphs for this line (if drop shadow enabled).
-             * Uses the same glyph lookup as the foreground pass
-             * below — but only when need_align is false.  When alignment
-             * is needed, we defer shadow to after the alignment shift. */
-            if (have_drop && !need_align)
-            {
-               const char *scan = line_start;
-               int sx           = lx + drop_x_px;
-               int sy           = fg_ly + drop_y_px;
-               while (scan < line_end)
-               {
-                  const struct font_glyph *glyph;
-                  uint32_t code  = utf8_walk(&scan);
-
-                  if (!(glyph = get_glyph(font_data, code)))
-                     if (!(glyph = glyph_q))
-                        continue;
-
-                  v->pos.x           = (sx + glyph->draw_offset_x * scale) * inv_vp_w;
-                  v->pos.y           = (sy + glyph->draw_offset_y * scale) * inv_vp_h;
-                  v->pos.w           = glyph->width  * scale_inv_vp_w;
-                  v->pos.h           = glyph->height * scale_inv_vp_h;
-                  v->coords.u        = glyph->atlas_offset_x * inv_tex_w;
-                  v->coords.v        = glyph->atlas_offset_y * inv_tex_h;
-                  v->coords.w        = glyph->width  * inv_tex_w;
-                  v->coords.h        = glyph->height * inv_tex_h;
-                  v->params.scaling  = 1;
-                  v->params.rotation = 0;
-                  v->colors[0]       = color_dark;
-                  v->colors[1]       = color_dark;
-                  v->colors[2]       = color_dark;
-                  v->colors[3]       = color_dark;
-
-                  v++;
-
-                  sx                += glyph->advance_x * scale;
-                  sy                += glyph->advance_y * scale;
-               }
-            }
-
-            /* Emit foreground glyphs for this line. */
-            {
-               const char *scan       = line_start;
-               d3d11_sprite_t *v_line = v;
-               int fx                 = lx;
-               int fy                 = fg_ly;
-               while (scan < line_end)
-               {
-                  const struct font_glyph *glyph;
-                  uint32_t code  = utf8_walk(&scan);
-
-                  if (!(glyph = get_glyph(font_data, code)))
-                     if (!(glyph = glyph_q))
-                        continue;
-
-                  v->pos.x           = (fx + glyph->draw_offset_x * scale) * inv_vp_w;
-                  v->pos.y           = (fy + glyph->draw_offset_y * scale) * inv_vp_h;
-                  v->pos.w           = glyph->width  * scale_inv_vp_w;
-                  v->pos.h           = glyph->height * scale_inv_vp_h;
-                  v->coords.u        = glyph->atlas_offset_x * inv_tex_w;
-                  v->coords.v        = glyph->atlas_offset_y * inv_tex_h;
-                  v->coords.w        = glyph->width  * inv_tex_w;
-                  v->coords.h        = glyph->height * inv_tex_h;
-                  v->params.scaling  = 1;
-                  v->params.rotation = 0;
-                  v->colors[0]       = color;
-                  v->colors[1]       = color;
-                  v->colors[2]       = color;
-                  v->colors[3]       = color;
-
-                  v++;
-
-                  fx                += glyph->advance_x * scale;
-                  fy                += glyph->advance_y * scale;
-               }
-
-               /* Retroactive alignment shift — avoids a separate
-                * measurement pass.  The total advance is fx - lx (pixels).
-                * Shift every foreground sprite's pos.x in this line. */
-               if (need_align)
-               {
-                  float shift_vp;
-                  int advance_px = fx - lx;
-                  if (text_align == TEXT_ALIGN_RIGHT)
-                     shift_vp = -(float)(int)(advance_px * scale) * inv_vp_w;
-                  else /* TEXT_ALIGN_CENTER */
-                     shift_vp = -(float)((int)(advance_px * scale) / 2) * inv_vp_w;
-
-                  if (shift_vp != 0.0f)
-                  {
-                     d3d11_sprite_t *s;
-                     for (s = v_line; s < v; s++)
-                        s->pos.x += shift_vp;
-                  }
-
-                  /* Now emit shadow glyphs for this aligned line.
-                   * Shadow must appear before foreground in the VBO so
-                   * it draws behind the text.  Clone the foreground
-                   * sprites with shadow offset + color, then swap the
-                   * two blocks so shadow comes first. */
-                  if (have_drop)
-                  {
-                     float dx_vp = (float)drop_x_px * inv_vp_w;
-                     float dy_vp = (float)drop_y_px * inv_vp_h;
-                     unsigned fg_count = (unsigned)(v - v_line);
-                     d3d11_sprite_t *s;
-                     /* Append shadow copies after foreground (temporary) */
-                     for (s = v_line; s < v_line + fg_count; s++)
-                     {
-                        d3d11_sprite_t tmp = *s;
-                        tmp.pos.x   += dx_vp;
-                        tmp.pos.y   += dy_vp;
-                        tmp.colors[0] = color_dark;
-                        tmp.colors[1] = color_dark;
-                        tmp.colors[2] = color_dark;
-                        tmp.colors[3] = color_dark;
-                        *v = tmp;
-                        v++;
-                     }
-                     /* Reorder: swap fg and shadow blocks in-place
-                      * so shadow draws first (painters order). */
-                     {
-                        unsigned i;
-                        d3d11_sprite_t *fg_start   = v_line;
-                        d3d11_sprite_t *shad_start = v_line + fg_count;
-                        for (i = 0; i < fg_count; i++)
-                        {
-                           d3d11_sprite_t tmp = fg_start[i];
-                           fg_start[i]        = shad_start[i];
-                           shad_start[i]      = tmp;
-                        }
-                     }
-                  }
-               }
-            }
-         }
-
-         if (!*delim)
-            break;
-         line_start = delim + 1;
-         lines++;
-      }
+#define FONT_LAYOUT_ALIGNED have_drop
+      /* An empty line, or one too long for the sprite buffer, is not
+       * looked up either */
+#define FONT_LAYOUT_SKIP(line, bytes) \
+      ((bytes) == 0 || (bytes) > (unsigned)capacity)
+#define FONT_LAYOUT_LINE(line, width, count, bytes) \
+      do \
+      { \
+         (void)(width); \
+         line_ok = ((bytes) > 0 && (bytes) <= (unsigned)capacity); \
+         fg_ly   = (int)roundf((1.0f - (y - (float)(line) * line_height)) \
+               * height); \
+         fx      = lx; \
+         fy      = fg_ly; \
+         sx      = lx + drop_x_px; \
+         sy      = fg_ly + drop_y_px; \
+         v_line  = v; \
+         n       = (count); \
+         k       = 0; \
+      } while (0)
+#define FONT_LAYOUT_GLYPH(glyph, pen_x, pen_y) \
+      do \
+      { \
+         /* This driver keeps its own truncating pen */ \
+         (void)(pen_x); \
+         (void)(pen_y); \
+         if (!line_ok) \
+            break; \
+         if (!have_drop) \
+            D3D11_FONT_SPRITE(v_line + k, fx, fy, glyph, color); \
+         else \
+         { \
+            D3D11_FONT_SPRITE(v_line + n + k, fx, fy, glyph, color); \
+            if (!need_align) \
+            { \
+               D3D11_FONT_SPRITE(v_line + k, sx, sy, glyph, color_dark); \
+               sx += (glyph)->advance_x * scale; \
+               sy += (glyph)->advance_y * scale; \
+            } \
+         } \
+         k++; \
+         fx += (glyph)->advance_x * scale; \
+         fy += (glyph)->advance_y * scale; \
+      } while (0)
+#define FONT_LAYOUT_LINE_END() \
+      do \
+      { \
+         d3d11_sprite_t *fg = have_drop ? v_line + n : v_line; \
+         if (!line_ok) \
+            break; \
+         /* Right and centred: shift the line by its advance */ \
+         if (need_align) \
+         { \
+            float shift_vp; \
+            int advance_px = fx - lx; \
+            if (text_align == TEXT_ALIGN_RIGHT) \
+               shift_vp = -(float)(int)(advance_px * scale) * inv_vp_w; \
+            else /* TEXT_ALIGN_CENTER */ \
+               shift_vp = -(float)((int)(advance_px * scale) / 2) * inv_vp_w; \
+            if (shift_vp != 0.0f) \
+            { \
+               unsigned j; \
+               for (j = 0; j < k; j++) \
+                  fg[j].pos.x += shift_vp; \
+            } \
+            if (have_drop) \
+            { \
+               unsigned j; \
+               float dx_vp = (float)drop_x_px * inv_vp_w; \
+               float dy_vp = (float)drop_y_px * inv_vp_h; \
+               for (j = 0; j < k; j++) \
+               { \
+                  v_line[j]            = fg[j]; \
+                  v_line[j].pos.x     += dx_vp; \
+                  v_line[j].pos.y     += dy_vp; \
+                  v_line[j].colors[0]  = color_dark; \
+                  v_line[j].colors[1]  = color_dark; \
+                  v_line[j].colors[2]  = color_dark; \
+                  v_line[j].colors[3]  = color_dark; \
+               } \
+            } \
+         } \
+         v = fg + k; \
+      } while (0)
+#include "../font_layout.h"
+#undef D3D11_FONT_SPRITE
    }
 
    total_count = (unsigned)(v
@@ -1820,6 +1980,12 @@ static uint32_t d3d11_get_flags(void *data)
 {
    uint32_t flags = 0;
 
+#if defined(HAVE_WINDOW) && defined(HAVE_MONITOR)
+   /* a borderless fullscreen toggle restyles the window; see
+    * d3d11_set_video_mode() */
+   if (win32_fullscreen_in_place())
+      BIT32_SET(flags, GFX_CTX_FLAGS_FULLSCREEN_IN_PLACE);
+#endif
    BIT32_SET(flags, GFX_CTX_FLAGS_CUSTOMIZABLE_FRAME_LATENCY);
    BIT32_SET(flags, GFX_CTX_FLAGS_MENU_FRAME_FILTERING);
    BIT32_SET(flags, GFX_CTX_FLAGS_OVERLAY_BEHIND_MENU_SUPPORTED);
@@ -3227,7 +3393,14 @@ static void d3d11_gfx_free(void* data)
    for (i = 0; i < GFX_MAX_SHADERS; i++)
       d3d11_release_shader(&d3d11->shaders[i]);
 
-   Release(d3d11->menu_pipeline_vbo);
+   d3d11_release_shader(&d3d11->mesh_shader);
+   Release(d3d11->mesh_ubo);
+   for (i = 0; i < (int)ARRAY_SIZE(d3d11->meshes); i++)
+   {
+      Release(d3d11->meshes[i].vbo);
+      Release(d3d11->meshes[i].ibo);
+      d3d11->meshes[i].id = 0;
+   }
    Release(d3d11->blend_pipeline);
 
    Release(d3d11->ubo);
@@ -3248,6 +3421,17 @@ static void d3d11_gfx_free(void* data)
    Release(d3d11->scissor_enabled);
    Release(d3d11->scissor_disabled);
    Release(d3d11->swapChain);
+   /* Direct3D 11 puts off destroying what is released until the
+    * context is flushed, and the context can outlive this driver (it
+    * is cached for a hardware-rendered core). A swap chain that is
+    * still there holds on to the window, and DXGI makes no second one
+    * on a window that has one: so it is destroyed now, for the driver
+    * that may take the window. */
+   if (d3d11->context)
+   {
+      d3d11->context->lpVtbl->ClearState(d3d11->context);
+      d3d11->context->lpVtbl->Flush(d3d11->context);
+   }
 
    video_st_flags                  = (uint32_t)retro_atomic_load_relaxed_int(&video_st->flags);
    if (video_st_flags & VIDEO_FLAG_CACHE_CONTEXT)
@@ -3275,12 +3459,18 @@ static void d3d11_gfx_free(void* data)
    video_driver_modify_disp_flags(0, VIDEO_FLAG_HDR_SUPPORT | VIDEO_FLAG_HDR10_SUPPORT | VIDEO_FLAG_SCRGB_SUPPORT);
 #endif
 
+#if defined(HAVE_WINDOW) && defined(HAVE_MONITOR)
+   /* left up for the next D3D11 driver, where it can be */
+   if (!win32_window_keep())
+#endif
+   {
 #ifdef HAVE_MONITOR
-   win32_monitor_from_window();
+      win32_monitor_from_window();
 #endif
 #ifdef HAVE_WINDOW
-   win32_destroy_window();
+      win32_destroy_window();
 #endif
+   }
    free(d3d11);
 }
 
@@ -3511,6 +3701,25 @@ static bool d3d11_init_swapchain(d3d11_video_t* d3d11,
                dxgiFactory, (IUnknown*)d3d11->device,
                &desc, (IDXGISwapChain**)&d3d11->swapChain)))
    {
+#if defined(HAVE_WINDOW) && defined(HAVE_MONITOR)
+      /* On a window taken from the last driver the likelier reason is
+       * the window, not the swap model: the caller makes a new window
+       * and comes back, rather than this settling for less. */
+      if (win32_window_was_taken())
+      {
+         dxgiFactory->lpVtbl->Release(dxgiFactory);
+         adapter->lpVtbl->Release(adapter);
+         dxgiDevice->lpVtbl->Release(dxgiDevice);
+         /* the device goes back where the second attempt takes it
+          * from, instead of a second one being made */
+         *cached_device               = d3d11->device;
+         *cached_context              = d3d11->context;
+         cached_supportedFeatureLevel = d3d11->supportedFeatureLevel;
+         d3d11->device                = NULL;
+         d3d11->context               = NULL;
+         return false;
+      }
+#endif
       RARCH_WARN("[D3D11] Failed to create swapchain with flip model, try non-flip model.\n");
 
       /* Failed to create swapchain, try non-flip model */
@@ -3629,16 +3838,15 @@ static void *d3d11_gfx_init(const video_info_t* video,
 #endif
 #ifdef HAVE_MONITOR
    win32_monitor_init();
-   wndclass.lpfnWndProc = wnd_proc_d3d_common;
-#ifdef HAVE_DINPUT
-   if (string_is_equal(settings->arrays.input_driver, "dinput"))
-      wndclass.lpfnWndProc = wnd_proc_d3d_dinput;
-#endif
-#ifdef HAVE_WINRAWINPUT
-   if (string_is_equal(settings->arrays.input_driver, "raw"))
-      wndclass.lpfnWndProc = wnd_proc_d3d_winraw;
-#endif
+   /* one window procedure for every video and input driver; the
+    * family says what creating the window sets up */
+   wndclass.lpfnWndProc = win32_window_proc;
+   win32_window_proc_setup(WIN32_WINDOW_D3D);
 #ifdef HAVE_WINDOW
+   /* the window may be left up for the next D3D11 driver, and taken
+    * from the last: d3d11_gfx_free() and the swap chain's creation
+    * below do what that needs */
+   win32_window_tag("d3d11");
    win32_window_init(&wndclass, true, NULL);
 #endif
 
@@ -3659,8 +3867,6 @@ static void *d3d11_gfx_init(const video_info_t* video,
       RARCH_ERR("[D3D11] win32_set_video_mode failed.\n");
       goto error;
    }
-
-   d3d_input_driver(settings->arrays.input_driver, settings->arrays.input_joypad_driver, input, input_data);
 
 #ifdef __WINRT__
    DXGICreateFactory2(&d3d11->factory);
@@ -3703,8 +3909,28 @@ static void *d3d11_gfx_init(const video_info_t* video,
             &cached_context_d3d11,
             main_window.hwnd
             ))
-      goto error;
+   {
+#if defined(HAVE_WINDOW) && defined(HAVE_MONITOR)
+      /* On a window the last driver left up, DXGI may refuse a swap
+       * chain - something of the old one is still alive on it. Then
+       * the window is not worth having: a new one, and once more. */
+      if (     !win32_window_was_taken()
+            || !win32_window_remake(d3d11, d3d11->vp.full_dims,
+                  video->fullscreen)
+            || !d3d11_init_swapchain(d3d11,
+                  VIDEO_SCALE_W(d3d11->vp.full_dims),
+                  VIDEO_SCALE_H(d3d11->vp.full_dims),
+                  &cached_device_d3d11,
+                  &cached_context_d3d11,
+                  main_window.hwnd))
 #endif
+         goto error;
+   }
+#endif
+
+   /* no input driver of this driver's own: the frontend starts the
+    * one that goes with a Windows window */
+   input_driver_left_to_frontend(INPUT_WINDOW_WINDOWS, input, input_data);
 
    matrix_4x4_identity(d3d11->identity);
 
@@ -3976,6 +4202,39 @@ static void *d3d11_gfx_init(const video_info_t* video,
          goto error;
    }
 
+   /* gfx_display meshes, read as stored: three floats, then two 16-bit
+    * and four 8-bit normalised integers. Without them meshes are
+    * streamed through draw() instead. */
+   {
+      D3D11_BUFFER_DESC buf_desc;
+      D3D11_INPUT_ELEMENT_DESC desc[] = {
+         { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0,
+            D3D11_INPUT_PER_VERTEX_DATA, 0 },
+         { "TEXCOORD", 0, DXGI_FORMAT_R16G16_UNORM, 0, 12,
+            D3D11_INPUT_PER_VERTEX_DATA, 0 },
+         { "COLOR", 0, DXGI_FORMAT_R8G8B8A8_UNORM, 0, 16,
+            D3D11_INPUT_PER_VERTEX_DATA, 0 },
+      };
+      static const char shader[] =
+#include "d3d_shaders/mesh_sm4.hlsl.h"
+         ;
+      if (!d3d11_init_shader(
+               d3d11->device, shader, sizeof(shader), NULL, "VSMain", "PSMain", NULL, desc,
+               countof(desc), &d3d11->mesh_shader,
+               D3D11_FEATURE_LEVEL_HINT_DONTCARE))
+         d3d11_release_shader(&d3d11->mesh_shader);
+
+      buf_desc.ByteWidth           = sizeof(math_matrix_4x4) + 4 * sizeof(float);
+      buf_desc.Usage               = D3D11_USAGE_DYNAMIC;
+      buf_desc.BindFlags           = D3D11_BIND_CONSTANT_BUFFER;
+      buf_desc.CPUAccessFlags      = D3D11_CPU_ACCESS_WRITE;
+      buf_desc.MiscFlags           = 0;
+      buf_desc.StructureByteStride = 0;
+      if (FAILED(d3d11->device->lpVtbl->CreateBuffer(
+               d3d11->device, &buf_desc, NULL, &d3d11->mesh_ubo)))
+         d3d11->mesh_ubo = NULL;
+   }
+
    {
       D3D11_INPUT_ELEMENT_DESC desc[] = {
          { "POSITION", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, offsetof(d3d11_sprite_t, pos),
@@ -4044,86 +4303,6 @@ static void *d3d11_gfx_init(const video_info_t* video,
 #endif
    }
 
-   if (string_is_equal(settings->arrays.menu_driver, "xmb"))
-   {
-      {
-         D3D11_INPUT_ELEMENT_DESC desc[] = {
-            { "POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0 },
-         };
-
-         static const char ribbon[] =
-#include "d3d_shaders/ribbon_sm4.hlsl.h"
-            ;
-         static const char ribbon_simple[] =
-#include "d3d_shaders/ribbon_simple_sm4.hlsl.h"
-            ;
-
-         if (!d3d11_init_shader(
-                  d3d11->device, ribbon,
-                  sizeof(ribbon), NULL, "VSMain", "PSMain", NULL, desc,
-                  countof(desc), &d3d11->shaders[VIDEO_SHADER_MENU],
-                  D3D11_FEATURE_LEVEL_HINT_DONTCARE))
-            goto error;
-
-         if (!d3d11_init_shader(
-                  d3d11->device, ribbon_simple,
-                  sizeof(ribbon_simple), NULL, "VSMain", "PSMain", NULL,
-                  desc, countof(desc), &d3d11->shaders[VIDEO_SHADER_MENU_2],
-                  D3D11_FEATURE_LEVEL_HINT_DONTCARE))
-            goto error;
-      }
-
-      {
-         D3D11_INPUT_ELEMENT_DESC desc[] = {
-            { "POSITION", 0, DXGI_FORMAT_R32G32_FLOAT,
-               0, offsetof(d3d11_vertex_t, position),
-               D3D11_INPUT_PER_VERTEX_DATA, 0 },
-            { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT,
-               0, offsetof(d3d11_vertex_t, texcoord),
-               D3D11_INPUT_PER_VERTEX_DATA, 0 },
-         };
-
-         static const char simple_snow[] =
-#include "d3d_shaders/simple_snow_sm4.hlsl.h"
-            ;
-         static const char snow[] =
-#include "d3d_shaders/snow_sm4.hlsl.h"
-            ;
-         static const char bokeh[] =
-#include "d3d_shaders/bokeh_sm4.hlsl.h"
-            ;
-         static const char snowflake[] =
-#include "d3d_shaders/snowflake_sm4.hlsl.h"
-            ;
-
-         if (!d3d11_init_shader(
-                  d3d11->device, simple_snow,
-                  sizeof(simple_snow), NULL, "VSMain", "PSMain", NULL,
-                  desc, countof(desc), &d3d11->shaders[VIDEO_SHADER_MENU_3],
-                  D3D11_FEATURE_LEVEL_HINT_DONTCARE))
-            goto error;
-         if (!d3d11_init_shader(
-                  d3d11->device, snow,
-                  sizeof(snow), NULL, "VSMain", "PSMain", NULL, desc,
-                  countof(desc), &d3d11->shaders[VIDEO_SHADER_MENU_4],
-                  D3D11_FEATURE_LEVEL_HINT_DONTCARE))
-            goto error;
-
-         if (!d3d11_init_shader(
-                  d3d11->device, bokeh,
-                  sizeof(bokeh), NULL, "VSMain", "PSMain", NULL, desc,
-                  countof(desc), &d3d11->shaders[VIDEO_SHADER_MENU_5],
-                  D3D11_FEATURE_LEVEL_HINT_DONTCARE))
-            goto error;
-
-         if (!d3d11_init_shader(
-                  d3d11->device, snowflake,
-                  sizeof(snowflake), NULL, "VSMain", "PSMain", NULL, desc,
-                  countof(desc), &d3d11->shaders[VIDEO_SHADER_MENU_6],
-                  D3D11_FEATURE_LEVEL_HINT_DONTCARE))
-            goto error;
-      }
-   }
 
    {
       D3D11_BLEND_DESC blend_desc = { 0 };
@@ -4780,23 +4959,37 @@ static unsigned d3d11_present_last_body(void *data)
  * statistics, converted to the QPC-based clock cpu_features_get_time_usec()
  * keeps on Windows. 0 when the swapchain cannot say (windowed blit
  * model, or statistics disjoint after a mode change). */
+/* The vblank the most recent present went out on, for display pacing.
+ * The swapchain's statistics say so only while they describe that
+ * present: a present made with sync interval 0, tearing allowed, is on
+ * no vblank, and leaves them at the last one that was - a time the
+ * presenter would step forward by a rounded period, drifting off the
+ * display's grid the longer it stays. Then, and whenever the statistics
+ * cannot be had, the compositor's own last vblank, as the Vulkan
+ * driver reads it on Windows. */
 static retro_time_t d3d11_get_last_present_time(void *data)
 {
    DXGI_FRAME_STATISTICS stats;
+   UINT last_present    = 0;
    static LARGE_INTEGER freq;
    d3d11_video_t *d3d11 = (d3d11_video_t*)data;
 
    if (!d3d11 || !d3d11->swapChain)
       return 0;
-   if (FAILED(d3d11->swapChain->lpVtbl->GetFrameStatistics(
-               d3d11->swapChain, &stats)))
-      return 0;
-   if (!stats.SyncQPCTime.QuadPart)
-      return 0;
-   if (!freq.QuadPart && !QueryPerformanceFrequency(&freq))
-      return 0;
-   return (stats.SyncQPCTime.QuadPart / freq.QuadPart * 1000000)
-        + (stats.SyncQPCTime.QuadPart % freq.QuadPart * 1000000 / freq.QuadPart);
+   if (     SUCCEEDED(d3d11->swapChain->lpVtbl->GetFrameStatistics(
+               d3d11->swapChain, &stats))
+         && SUCCEEDED(d3d11->swapChain->lpVtbl->GetLastPresentCount(
+               d3d11->swapChain, &last_present))
+         && stats.PresentCount == last_present
+         && stats.SyncQPCTime.QuadPart
+         && (freq.QuadPart || QueryPerformanceFrequency(&freq)))
+      return (stats.SyncQPCTime.QuadPart / freq.QuadPart * 1000000)
+           + (stats.SyncQPCTime.QuadPart % freq.QuadPart * 1000000 / freq.QuadPart);
+#if !defined(__WINRT__) && !defined(_XBOX)
+   return win32_dwm_last_vblank_time();
+#else
+   return 0;
+#endif
 }
 
 /* The view to draw a version 3 core's texture through. A core rotates a
@@ -7049,11 +7242,33 @@ static unsigned d3d11_get_swap_interval_cap(void *data)
    return 4;
 }
 
+/* A borderless fullscreen toggle. It used to restart every driver:
+ * this one freed its device, shaders, swap chain and every texture
+ * and made them all again, the audio driver stopped and
+ * started, and a hardware-rendered core was told its context was gone
+ * - for a change of the window's style and size. The window is
+ * restyled where it stands instead (win32_window_set_fullscreen());
+ * the size change reaches the driver through check_window like any
+ * resize, and the swap chain's buffers are resized as they are when
+ * the window's edge is dragged. Nothing else is touched.
+ * RETROARCH_FULLSCREEN_IN_PLACE=0 turns it off. */
+#if defined(HAVE_WINDOW) && defined(HAVE_MONITOR)
+static void d3d11_set_video_mode(void *data, unsigned dims, bool fullscreen)
+{
+   (void)data;
+   win32_window_set_fullscreen(dims, fullscreen);
+}
+#endif
+
 static const video_poke_interface_t d3d11_poke_interface = {
    d3d11_get_flags,
    d3d11_gfx_load_texture,
    d3d11_gfx_unload_texture,
+#if defined(HAVE_WINDOW) && defined(HAVE_MONITOR)
+   d3d11_set_video_mode,
+#else
    NULL, /* set_video_mode */
+#endif
 #ifdef __WINRT__
    /* UWP does not expose this information easily */
    NULL, /* get_refresh_rate */
@@ -7184,5 +7399,6 @@ gfx_display_ctx_driver_t gfx_display_ctx_d3d11 = {
    true,
    true,
    gfx_display_d3d11_scissor_begin,
-   gfx_display_d3d11_scissor_end
+   gfx_display_d3d11_scissor_end,
+   gfx_display_d3d11_mesh_draw
 };

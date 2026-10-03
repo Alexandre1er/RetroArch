@@ -39,6 +39,7 @@
 #include <string/stdstring.h>
 
 #include "../input_driver.h"
+#include "../common/linux_not_joystick.h"
 
 #include "../../configuration.h"
 #include "../../config.def.h"
@@ -503,6 +504,17 @@ static int udev_add_pad(struct udev_device *dev, unsigned p, int fd, const char 
       pad->vid = inputid.vendor;
       pad->pid = inputid.product;
    }
+
+   /* Not a controller, whatever udev says: leave the slot free. */
+   if (linux_input_is_not_joystick(pad->ident, pad->vid, pad->pid))
+   {
+      RARCH_LOG("[udev] Ignoring \"%s\" (%04x:%04x, %s): tagged as a"
+            " joystick, but it is not one.\n",
+            pad->ident, pad->vid, pad->pid, path);
+      pad->ident[0] = '\0';
+      pad->vid      = pad->pid = 0;
+      return -2;
+   }
    if (ioctl(fd, EVIOCGPHYS(sizeof(pad->phys)), pad->phys) < 0)
       pad->phys[0] = '\0';  /* Clear if unavailable */
    else
@@ -642,9 +654,12 @@ static void udev_check_device(struct udev_device *dev, const char *path)
    if ((fd = udev_open_joystick(path)) < 0)
       return;
 
-   if (udev_add_pad(dev, pad, fd, path) == -1)
+   /* -1: could not be read. -2: read, and found not to be a
+    * controller. Neither keeps the descriptor. */
+   if ((ret = udev_add_pad(dev, pad, fd, path)) < 0)
    {
-      RARCH_ERR("[udev] Failed to add pad: %s.\n", path);
+      if (ret == -1)
+         RARCH_ERR("[udev] Failed to add pad: %s.\n", path);
       close(fd);
    }
 }

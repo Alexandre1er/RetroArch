@@ -82,14 +82,64 @@ static INLINE void sdl_tex_zero(sdl2_tex_t *t)
    t->pitch = 0;
 }
 
+/* Makes the OSD font's texture from its atlas, as it stands: at init,
+ * and again whenever glyphs are new to the atlas or it has grown. */
+static void sdl2_font_upload(sdl2_video_t *vid, struct font_atlas *atlas)
+{
+   int i;
+   SDL_Color colors[256];
+   SDL_Surface *tmp = NULL;
+   SDL_Palette *pal = NULL;
+
+   if (vid->font.tex)
+   {
+      SDL_DestroyTexture(vid->font.tex);
+      vid->font.tex    = NULL;
+      vid->font.active = false;
+   }
+
+   tmp = SDL_CreateRGBSurfaceFrom(
+         atlas->buffer, atlas->width,
+         atlas->height, 8, atlas->width,
+         0, 0, 0, 0);
+   if (!tmp)
+      return;
+
+   for (i = 0; i < 256; ++i)
+   {
+      colors[i].r = colors[i].g = colors[i].b = i;
+      colors[i].a = 255;
+   }
+
+   pal = SDL_AllocPalette(256);
+   SDL_SetPaletteColors(pal, colors, 0, 256);
+   SDL_SetSurfacePalette(tmp, pal);
+   SDL_SetColorKey(tmp, SDL_TRUE, 0);
+
+   vid->font.tex  = SDL_CreateTextureFromSurface(vid->renderer, tmp);
+
+   if (vid->font.tex)
+   {
+      vid->font.dims   = VIDEO_SCALE_PACK(atlas->width, atlas->height);
+      vid->font.active = true;
+
+      SDL_SetTextureBlendMode(vid->font.tex, SDL_BLENDMODE_ADD);
+      SDL_SetTextureColorMod(vid->font.tex,
+            vid->font_r, vid->font_g, vid->font_b);
+   }
+   else
+      RARCH_WARN("[SDL2] Failed to initialize font texture: %s\n", SDL_GetError());
+
+   SDL_FreePalette(pal);
+   SDL_FreeSurface(tmp);
+   atlas->dirty = false;
+}
+
 static void sdl2_init_font(sdl2_video_t *vid, const char *font_path,
       unsigned font_size)
 {
-   int i, r, g, b;
-   SDL_Color colors[256];
-   SDL_Surface               *tmp = NULL;
-   SDL_Palette               *pal = NULL;
-   const struct font_atlas *atlas = NULL;
+   int r, g, b;
+   struct font_atlas      *atlas = NULL;
    settings_t           *settings = config_get_ptr();
    bool video_font_enable         = settings->bools.video_font_enable;
    float msg_color_r              = settings->floats.video_msg_color_r;
@@ -119,38 +169,8 @@ static void sdl2_init_font(sdl2_video_t *vid, const char *font_path,
    vid->font_g = g;
    vid->font_b = b;
 
-   atlas       = vid->font_driver->get_atlas(vid->font_data);
-
-   tmp         = SDL_CreateRGBSurfaceFrom(
-         atlas->buffer, atlas->width,
-         atlas->height, 8, atlas->width,
-         0, 0, 0, 0);
-
-   for (i = 0; i < 256; ++i)
-   {
-      colors[i].r = colors[i].g = colors[i].b = i;
-      colors[i].a = 255;
-   }
-
-   pal = SDL_AllocPalette(256);
-   SDL_SetPaletteColors(pal, colors, 0, 256);
-   SDL_SetSurfacePalette(tmp, pal);
-   SDL_SetColorKey(tmp, SDL_TRUE, 0);
-
-   vid->font.tex  = SDL_CreateTextureFromSurface(vid->renderer, tmp);
-
-   if (vid->font.tex)
-   {
-      vid->font.dims   = VIDEO_SCALE_PACK(atlas->width, atlas->height);
-      vid->font.active = true;
-
-      SDL_SetTextureBlendMode(vid->font.tex, SDL_BLENDMODE_ADD);
-   }
-   else
-      RARCH_WARN("[SDL2] Failed to initialize font texture: %s\n", SDL_GetError());
-
-   SDL_FreePalette(pal);
-   SDL_FreeSurface(tmp);
+   if ((atlas = vid->font_driver->get_atlas(vid->font_data)))
+      sdl2_font_upload(vid, atlas);
 }
 
 /* The caller supplies the message position: frame() takes it from the
@@ -161,9 +181,15 @@ static void sdl2_init_font(sdl2_video_t *vid, const char *font_path,
 static void sdl2_render_msg(sdl2_video_t *vid, const char *msg,
       float msg_pos_x, float msg_pos_y)
 {
-   int delta_x, delta_y, x, y;
+   int x, y, line_x, line_y;
    unsigned width, height;
-
+   size_t msg_len;
+   int line_height                   = 0;
+   struct font_line_metrics *metrics = NULL;
+   struct font_atlas *atlas;
+   const struct font_glyph *(*get_glyph)(void*, uint32_t);
+   void *font_data;
+   const struct font_glyph *glyph_q;
 
    /* Legacy bitmap OSD font path.  Used as a fallback for the
     * yellow-text OSD output when widgets are disabled, and as the
@@ -174,43 +200,50 @@ static void sdl2_render_msg(sdl2_video_t *vid, const char *msg,
    if (!msg || !*msg || !vid->font_data || !vid->font.tex)
       return;
 
-   delta_x   = 0;
-   delta_y   = 0;
+   get_glyph = vid->font_driver->get_glyph;
+   font_data = vid->font_data;
+   if (!(atlas = vid->font_driver->get_atlas(font_data)))
+      return;
+   if (vid->font_driver->get_line_metrics)
+   {
+      vid->font_driver->get_line_metrics(font_data, &metrics);
+      if (metrics)
+         line_height = (int)(metrics->height + 0.5f);
+   }
+
+   msg_len   = strlen(msg);
+   glyph_q   = get_glyph(font_data, '?');
    width     = VIDEO_SCALE_W(vid->vp.dims);
    height    = VIDEO_SCALE_H(vid->vp.dims);
    x         = (int)(msg_pos_x * width);
    y         = (int)((1.0f - msg_pos_y) * height);
+   line_x    = x;
+   line_y    = y;
 
-   SDL_SetTextureColorMod(vid->font.tex,
-         vid->font_r, vid->font_g, vid->font_b);
-
-   for (; *msg; msg++)
-   {
-      SDL_Rect src_rect, dst_rect;
-      const struct font_glyph *gly =
-         vid->font_driver->get_glyph(vid->font_data, (uint8_t)*msg);
-
-      if (!gly)
-         gly = vid->font_driver->get_glyph(vid->font_data, '?');
-
-      if (!gly)
-         continue;
-
-      src_rect.x = gly->atlas_offset_x;
-      src_rect.y = gly->atlas_offset_y;
-      src_rect.w = (int)gly->width;
-      src_rect.h = (int)gly->height;
-
-      dst_rect.x = x + delta_x + gly->draw_offset_x;
-      dst_rect.y = y + delta_y + gly->draw_offset_y;
-      dst_rect.w = (int)gly->width;
-      dst_rect.h = (int)gly->height;
-
-      SDL_RenderCopy(vid->renderer, vid->font.tex, &src_rect, &dst_rect);
-
-      delta_x += gly->advance_x;
-      delta_y -= gly->advance_y;
+   /* Each line is looked up before it is drawn, so a glyph new to the
+    * atlas is in the texture by the time it is */
+#define FONT_LAYOUT_ALIGNED 1
+#define FONT_LAYOUT_LINE(line, line_width, count, bytes) \
+   if (     atlas->dirty \
+         || VIDEO_SCALE_PACK(atlas->width, atlas->height) != vid->font.dims) \
+      sdl2_font_upload(vid, atlas); \
+   line_x = x; \
+   line_y = y + (int)(line) * line_height;
+#define FONT_LAYOUT_GLYPH(glyph, pen_x, pen_y) \
+   if (vid->font.tex) \
+   { \
+      SDL_Rect src_rect, dst_rect; \
+      src_rect.x = (glyph)->atlas_offset_x; \
+      src_rect.y = (glyph)->atlas_offset_y; \
+      src_rect.w = (int)(glyph)->width; \
+      src_rect.h = (int)(glyph)->height; \
+      dst_rect.x = line_x + (pen_x) + (glyph)->draw_offset_x; \
+      dst_rect.y = line_y - (pen_y) + (glyph)->draw_offset_y; \
+      dst_rect.w = (int)(glyph)->width; \
+      dst_rect.h = (int)(glyph)->height; \
+      SDL_RenderCopy(vid->renderer, vid->font.tex, &src_rect, &dst_rect); \
    }
+#include "../font_layout.h"
 }
 
 static void sdl2_init_renderer(sdl2_video_t *vid)
@@ -365,7 +398,7 @@ static void *sdl2_gfx_init(const video_info_t *video,
     *
     * Unlike the d3d8 / d3d9 / d3d11 / d3d12 drivers - which create
     * their main window with a winraw-aware WndProc
-    * (wnd_proc_d3d_winraw, see gfx/common/win32_common.c) - the SDL2
+    * (win32_window_proc, see gfx/common/win32_common.c) - the SDL2
     * window's WndProc is owned by SDL and we cannot replace it.
     *
     * Warn loudly so users hitting silent broken-input understand
@@ -523,6 +556,9 @@ static void check_window(sdl2_video_t *vid)
          case SDL_WINDOWEVENT:
             if (event.window.event == SDL_WINDOWEVENT_RESIZED)
                vid->flags |= SDL2_FLAG_SHOULD_RESIZE;
+            /* It may be on another display now */
+            else if (event.window.event == SDL_WINDOWEVENT_MOVED)
+               video_driver_window_output_changed();
             break;
          default:
             break;
@@ -1620,6 +1656,18 @@ static void *sdl2_raster_font_init(void *data, const char *font_path,
    }
 
    font->atlas = font->font_driver->get_atlas(font->font_data);
+   /* The atlas may grow, up to the largest texture the renderer takes;
+    * the texture is remade at the atlas's size on every upload */
+   {
+      SDL_RendererInfo info;
+      if (     SDL_GetRendererInfo(vid->renderer, &info) == 0
+            && info.max_texture_width  > 0
+            && info.max_texture_height > 0)
+      {
+         font->atlas->max_width  = (unsigned)info.max_texture_width;
+         font->atlas->max_height = (unsigned)info.max_texture_height;
+      }
+   }
    sdl2_raster_font_upload_atlas(font);
 
    if (!font->tex)
@@ -1650,173 +1698,38 @@ static int sdl2_raster_font_get_message_width(void *data, const char *msg,
       size_t msg_len, float scale)
 {
    sdl2_raster_t *font = (sdl2_raster_t*)data;
-   const char    *cur  = msg;
-   const char    *end  = msg + msg_len;
-   int            width = 0;
-
-   if (!font || !msg)
+   if (!font)
       return 0;
-
-   /* Decode UTF-8 code points like every other raster font backend;
-    * byte-wise lookups turned multi-byte text into per-byte Latin-1
-    * glyph queries. */
-   while (cur < end && *cur)
-   {
-      uint32_t code = utf8_walk(&cur);
-      const struct font_glyph *glyph =
-         font->font_driver->get_glyph(font->font_data, code);
-      if (!glyph)
-         glyph = font->font_driver->get_glyph(font->font_data, '?');
-      if (glyph)
-         width += glyph->advance_x;
-   }
-
-   return (int)((float)width * scale);
+   return font_renderer_get_message_width(font->font_driver,
+         font->font_data, msg, msg_len, scale);
 }
 
-/* Render a single line into one SDL_RenderGeometry batch. Up to
- * MAX_GLYPHS per submitted batch; we flush mid-line for longer runs.
- *
- * Coordinates: render_msg gives us params->x/y in 0..1 normalized
- * space. We convert to pixel coords against the full window, with
- * a top-left origin (SDL convention). */
-static void sdl2_raster_font_render_line(
-      sdl2_raster_t *font,
-      const char *msg, size_t msg_len,
-      float scale,
-      const SDL_Color col,
-      float pos_x, float pos_y,
-      enum text_alignment align,
-      unsigned width, unsigned height)
-{
-   SDL_Vertex *verts = font->verts;
-   int        *idx   = font->idx;
-   int         n_glyphs = 0;
-   const char *cur      = msg;
-   const char *cur_end  = msg + msg_len;
-   float       x        = pos_x;
-   float       y        = pos_y;
-   float       inv_w;
-   float       inv_h;
-
-   if (!font || !font->tex)
-      return;
-
-   if (font->atlas_dirty || font->atlas->dirty)
-      sdl2_raster_font_upload_atlas(font);
-
-   /* gfx_display_draw_text gives us params->x/y in normalized 0..1
-    * coords (origin bottom-left to match GL). Convert to pixels
-    * with a top-left origin. */
-   x = pos_x * (float)width;
-   y = (1.0f - pos_y) * (float)height;
-
-   if (align == TEXT_ALIGN_RIGHT)
-      x -= sdl2_raster_font_get_message_width(font, msg, msg_len, scale);
-   else if (align == TEXT_ALIGN_CENTER)
-      x -= sdl2_raster_font_get_message_width(font, msg, msg_len, scale)
-         * 0.5f;
-
-   inv_w = 1.0f / (float)VIDEO_SCALE_W(font->tex_dims);
-   inv_h = 1.0f / (float)VIDEO_SCALE_H(font->tex_dims);
-
-   /* Decode UTF-8 code points like every other raster font backend;
-    * localized UI text is not ASCII-only and byte-wise lookups turned
-    * multi-byte sequences into per-byte Latin-1 glyph queries. */
-   while (cur < cur_end && *cur)
-   {
-      uint32_t code = utf8_walk(&cur);
-      const struct font_glyph *glyph =
-         font->font_driver->get_glyph(font->font_data, code);
-      float gx, gy, gw, gh;
-      float u0, v0, u1, v1;
-      int   base;
-
-      if (!glyph)
-         glyph = font->font_driver->get_glyph(font->font_data, '?');
-      if (!glyph)
-         continue;
-
-      gx = x + glyph->draw_offset_x * scale;
-      gy = y + glyph->draw_offset_y * scale;
-      gw = glyph->width  * scale;
-      gh = glyph->height * scale;
-
-      u0 = (float)glyph->atlas_offset_x * inv_w;
-      v0 = (float)glyph->atlas_offset_y * inv_h;
-      u1 = u0 + (float)glyph->width     * inv_w;
-      v1 = v0 + (float)glyph->height    * inv_h;
-
-      base = n_glyphs * 4;
-
-      verts[base + 0].position.x  = gx;
-      verts[base + 0].position.y  = gy;
-      verts[base + 0].tex_coord.x = u0;
-      verts[base + 0].tex_coord.y = v0;
-      verts[base + 0].color       = col;
-
-      verts[base + 1].position.x  = gx + gw;
-      verts[base + 1].position.y  = gy;
-      verts[base + 1].tex_coord.x = u1;
-      verts[base + 1].tex_coord.y = v0;
-      verts[base + 1].color       = col;
-
-      verts[base + 2].position.x  = gx;
-      verts[base + 2].position.y  = gy + gh;
-      verts[base + 2].tex_coord.x = u0;
-      verts[base + 2].tex_coord.y = v1;
-      verts[base + 2].color       = col;
-
-      verts[base + 3].position.x  = gx + gw;
-      verts[base + 3].position.y  = gy + gh;
-      verts[base + 3].tex_coord.x = u1;
-      verts[base + 3].tex_coord.y = v1;
-      verts[base + 3].color       = col;
-
-      idx[n_glyphs * 6 + 0] = base + 0;
-      idx[n_glyphs * 6 + 1] = base + 1;
-      idx[n_glyphs * 6 + 2] = base + 2;
-      idx[n_glyphs * 6 + 3] = base + 2;
-      idx[n_glyphs * 6 + 4] = base + 1;
-      idx[n_glyphs * 6 + 5] = base + 3;
-
-      x += glyph->advance_x * scale;
-      n_glyphs++;
-
-      if (n_glyphs >= SDL2_FONT_MAX_GLYPHS)
-      {
-         SDL_RenderGeometry(font->vid->renderer, font->tex,
-               verts, n_glyphs * 4, idx, n_glyphs * 6);
-         n_glyphs = 0;
-      }
-   }
-
-   if (n_glyphs > 0)
-      SDL_RenderGeometry(font->vid->renderer, font->tex,
-            verts, n_glyphs * 4, idx, n_glyphs * 6);
-#undef SDL2_FONT_MAX_GLYPHS
-}
-
-/* Walk a (possibly multi-line) string and call render_line once per
- * line segment, dropping each subsequent line by one line-height in
- * GL-convention (params->y increases upward, so we subtract).
- *
- * Required because callers like XMB sublabels embed real '\n' bytes
- * into their wrapped text — gfx_display_draw_text doesn't pre-split
- * for us, and feeding the newline straight to render_line just looks
- * up '\n' in the glyph atlas, gets a tofu placeholder, and renders it
- * as garbage (visible as a small box between words).  Mirrors gl1's
- * gl1_raster_font_render_message wrapper. */
+/* Lays the text out through gfx/font_layout.h, a line at a time, each
+ * line into SDL_RenderGeometry batches of up to SDL2_FONT_MAX_GLYPHS.
+ * params->x/y come in normalized 0..1 coordinates with the origin
+ * bottom-left, as for GL, and are turned into pixels from the top
+ * left; each later line drops by one line height. */
 static void sdl2_raster_font_render_message(
-      sdl2_raster_t *font, const char *msg, float scale,
+      sdl2_raster_t *font, const char *msg, size_t msg_len, float scale,
       const SDL_Color col, float pos_x, float pos_y,
       enum text_alignment align, unsigned width, unsigned height)
 {
    struct font_line_metrics *line_metrics = NULL;
    float line_height_norm                 = 0.0f;
-   int   lines                            = 0;
+   SDL_Vertex *verts                      = font->verts;
+   int        *idx                        = font->idx;
+   int         n_glyphs                   = 0;
+   bool        line_ok                    = false;
+   float       x                          = 0.0f;
+   float       y                          = 0.0f;
+   float       inv_w                      = 0.0f;
+   float       inv_h                      = 0.0f;
+   const struct font_glyph* (*get_glyph)(void*, uint32_t)
+                                          = font->font_driver->get_glyph;
+   void       *font_data                  = font->font_data;
+   const struct font_glyph *glyph_q       = NULL;
 
-   if (font->font_driver && font->font_driver->get_line_metrics)
+   if (font->font_driver->get_line_metrics)
    {
       font->font_driver->get_line_metrics(font->font_data, &line_metrics);
       if (line_metrics && height > 0)
@@ -1824,26 +1737,95 @@ static void sdl2_raster_font_render_message(
                           / (float)height;
    }
 
-   for (;;)
-   {
-      const char *p   = msg;
-      size_t      len;
+   /* Looked up before the layout: a right or centred line is measured
+    * before its first glyph is drawn, and the stand-in counts there */
+   glyph_q = get_glyph(font_data, '?');
 
-      while (*p && *p != '\n')
-         p++;
-      len = (size_t)(p - msg);
-
-      if (len > 0)
-         sdl2_raster_font_render_line(font, msg, len, scale, col,
-               pos_x,
-               pos_y - (float)lines * line_height_norm,
-               align, width, height);
-
-      if (!*p)
-         break;
-      msg = p + 1;
-      lines++;
-   }
+#define FONT_LAYOUT_ALIGNED (align == TEXT_ALIGN_RIGHT \
+      || align == TEXT_ALIGN_CENTER)
+#define FONT_LAYOUT_LINE(line, line_width, count, bytes) \
+   do \
+   { \
+      (void)(count); \
+      line_ok = ((bytes) > 0 && font->tex); \
+      if (!line_ok) \
+         break; \
+      if (font->atlas_dirty || font->atlas->dirty) \
+         sdl2_raster_font_upload_atlas(font); \
+      x = pos_x * (float)width; \
+      y = (1.0f - (pos_y - (float)(line) * line_height_norm)) \
+         * (float)height; \
+      if (align == TEXT_ALIGN_RIGHT) \
+         x -= (int)((float)(line_width) * scale); \
+      else if (align == TEXT_ALIGN_CENTER) \
+         x -= (int)((float)(line_width) * scale) * 0.5f; \
+      inv_w = 1.0f / (float)VIDEO_SCALE_W(font->tex_dims); \
+      inv_h = 1.0f / (float)VIDEO_SCALE_H(font->tex_dims); \
+      n_glyphs = 0; \
+   } while (0)
+#define FONT_LAYOUT_GLYPH(glyph, pen_x, pen_y) \
+   do \
+   { \
+      float gx, gy, gw, gh, u0, v0, u1, v1; \
+      int   base; \
+      /* This driver keeps its own pen, in floating point */ \
+      (void)(pen_x); \
+      (void)(pen_y); \
+      if (!line_ok) \
+         break; \
+      gx = x + (glyph)->draw_offset_x * scale; \
+      gy = y + (glyph)->draw_offset_y * scale; \
+      gw = (glyph)->width  * scale; \
+      gh = (glyph)->height * scale; \
+      u0 = (float)(glyph)->atlas_offset_x * inv_w; \
+      v0 = (float)(glyph)->atlas_offset_y * inv_h; \
+      u1 = u0 + (float)(glyph)->width     * inv_w; \
+      v1 = v0 + (float)(glyph)->height    * inv_h; \
+      base = n_glyphs * 4; \
+      verts[base + 0].position.x  = gx; \
+      verts[base + 0].position.y  = gy; \
+      verts[base + 0].tex_coord.x = u0; \
+      verts[base + 0].tex_coord.y = v0; \
+      verts[base + 0].color       = col; \
+      verts[base + 1].position.x  = gx + gw; \
+      verts[base + 1].position.y  = gy; \
+      verts[base + 1].tex_coord.x = u1; \
+      verts[base + 1].tex_coord.y = v0; \
+      verts[base + 1].color       = col; \
+      verts[base + 2].position.x  = gx; \
+      verts[base + 2].position.y  = gy + gh; \
+      verts[base + 2].tex_coord.x = u0; \
+      verts[base + 2].tex_coord.y = v1; \
+      verts[base + 2].color       = col; \
+      verts[base + 3].position.x  = gx + gw; \
+      verts[base + 3].position.y  = gy + gh; \
+      verts[base + 3].tex_coord.x = u1; \
+      verts[base + 3].tex_coord.y = v1; \
+      verts[base + 3].color       = col; \
+      idx[n_glyphs * 6 + 0] = base + 0; \
+      idx[n_glyphs * 6 + 1] = base + 1; \
+      idx[n_glyphs * 6 + 2] = base + 2; \
+      idx[n_glyphs * 6 + 3] = base + 2; \
+      idx[n_glyphs * 6 + 4] = base + 1; \
+      idx[n_glyphs * 6 + 5] = base + 3; \
+      x += (glyph)->advance_x * scale; \
+      if (++n_glyphs >= SDL2_FONT_MAX_GLYPHS) \
+      { \
+         SDL_RenderGeometry(font->vid->renderer, font->tex, \
+               verts, n_glyphs * 4, idx, n_glyphs * 6); \
+         n_glyphs = 0; \
+      } \
+   } while (0)
+#define FONT_LAYOUT_LINE_END() \
+   do \
+   { \
+      if (line_ok && n_glyphs > 0) \
+         SDL_RenderGeometry(font->vid->renderer, font->tex, \
+               verts, n_glyphs * 4, idx, n_glyphs * 6); \
+      n_glyphs = 0; \
+   } while (0)
+#include "../font_layout.h"
+#undef SDL2_FONT_MAX_GLYPHS
 }
 
 static void sdl2_raster_font_render_msg(
@@ -1852,6 +1834,7 @@ static void sdl2_raster_font_render_msg(
       const char *msg, size_t msg_len,
       const struct font_params *params)
 {
+   font_params_resolved_t rp;
    sdl2_raster_t *font = (sdl2_raster_t*)data;
    sdl2_video_t  *vid  = (sdl2_video_t*)userdata;
    SDL_Color      col;
@@ -1866,6 +1849,12 @@ static void sdl2_raster_font_render_msg(
    if (!font || !msg || !*msg || !vid)
       return;
 
+   /* Asked for before anything is laid out: it may have grown, which
+    * marks it dirty, and each line's upload remakes the texture at its
+    * size before its texture coordinates are taken */
+   if (font->font_driver && font->font_data)
+      font->atlas = font->font_driver->get_atlas(font->font_data);
+
    width  = VIDEO_SCALE_W(vid->vp.full_dims)  ? VIDEO_SCALE_W(vid->vp.full_dims)  : VIDEO_SCALE_W(vid->video.dims);
    height = VIDEO_SCALE_H(vid->vp.full_dims) ? VIDEO_SCALE_H(vid->vp.full_dims) : VIDEO_SCALE_H(vid->video.dims);
    if (!width || !height)
@@ -1875,35 +1864,22 @@ static void sdl2_raster_font_render_msg(
       return;
    }
 
-   if (params)
-   {
-      x          = params->x;
-      y          = params->y;
-      scale      = params->scale;
-      align      = params->text_align;
-      drop_x     = params->drop_x;
-      drop_y     = params->drop_y;
-      drop_mod   = params->drop_mod;
-      drop_alpha = params->drop_alpha;
+   font_driver_resolve_params(params, &rp);
+   x          = rp.x;
+   y          = rp.y;
+   scale      = rp.scale;
+   align      = rp.text_align;
+   drop_x     = rp.drop_x;
+   drop_y     = rp.drop_y;
+   drop_mod   = rp.drop_mod;
+   drop_alpha = rp.drop_alpha;
+   col.r      = rp.rgba[0];
+   col.g      = rp.rgba[1];
+   col.b      = rp.rgba[2];
+   col.a      = rp.rgba[3];
+   if (col.a == 0)
+      col.a   = 255;
 
-      col.r = FONT_COLOR_GET_RED(params->color);
-      col.g = FONT_COLOR_GET_GREEN(params->color);
-      col.b = FONT_COLOR_GET_BLUE(params->color);
-      col.a = FONT_COLOR_GET_ALPHA(params->color);
-      if (col.a == 0)
-         col.a = 255;
-   }
-   else
-   {
-      x          = 0.0f;
-      y          = 0.0f;
-      scale      = 1.0f;
-      drop_x     = 0;
-      drop_y     = 0;
-      drop_mod   = 0.0f;
-      drop_alpha = 0.0f;
-      col.r = col.g = col.b = col.a = 255;
-   }
 
    if (drop_x || drop_y)
    {
@@ -1912,13 +1888,15 @@ static void sdl2_raster_font_render_msg(
       col_drop.b = (Uint8)(col.b * drop_mod);
       col_drop.a = (Uint8)(col.a * drop_alpha);
 
-      sdl2_raster_font_render_message(font, msg, scale, col_drop,
+      sdl2_raster_font_render_message(font, msg, msg_len, scale,
+            col_drop,
             x + scale * drop_x / (float)width,
             y + scale * drop_y / (float)height,
             align, width, height);
    }
 
-   sdl2_raster_font_render_message(font, msg, scale, col,
+   sdl2_raster_font_render_message(font, msg, msg_len, scale,
+         col,
          x, y, align, width, height);
 }
 

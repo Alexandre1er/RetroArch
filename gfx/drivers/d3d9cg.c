@@ -1052,20 +1052,24 @@ static void gfx_display_d3d9_cg_draw_pipeline(gfx_display_ctx_draw_t *draw,
       gfx_display_t *p_disp,
       void *data, unsigned video_dims)
 {
-   video_coord_array_t *ca               = NULL;
+   struct video_coords *ca               = NULL;
    d3d9_video_t *d3d                     = (d3d9_video_t*)data;
 
    if (!d3d || !draw)
       return;
 
-   ca                                    = &p_disp->dispca;
+   ca                                    = gfx_display_effect_coords(p_disp);
+
+   if (!ca)
+
+      return;
 
    draw->pos                             = VIDEO_POS_PACK(0, 0);
    draw->coords                          = NULL;
    draw->matrix_data                     = NULL;
 
    if (ca)
-      draw->coords                       = (struct video_coords*)&ca->coords;
+      draw->coords                       = ca;
 
    switch (draw->pipeline_id)
    {
@@ -1074,11 +1078,11 @@ static void gfx_display_d3d9_cg_draw_pipeline(gfx_display_ctx_draw_t *draw,
       {
          /* Create a pipeline vertex buffer from the coordinate
           * array data if it doesn't already exist. */
-         if (!d3d9_cg_menu_pipeline_vbo && ca->coords.vertices)
+         if (!d3d9_cg_menu_pipeline_vbo && ca->vertices)
          {
             unsigned i;
             Vertex *verts    = NULL;
-            unsigned vcount  = ca->coords.vertices;
+            unsigned vcount  = ca->vertices;
 
             {
                void *_vbuf = NULL;
@@ -1101,8 +1105,8 @@ static void gfx_display_d3d9_cg_draw_pipeline(gfx_display_ctx_draw_t *draw,
                {
                   for (i = 0; i < vcount; i++)
                   {
-                     verts[i].x     = ca->coords.vertex[i * 2 + 0];
-                     verts[i].y     = ca->coords.vertex[i * 2 + 1];
+                     verts[i].x     = ca->vertex[i * 2 + 0];
+                     verts[i].y     = ca->vertex[i * 2 + 1];
                      verts[i].z     = 0.5f;
                      verts[i].u     = 0.0f;
                      verts[i].v     = 0.0f;
@@ -1122,7 +1126,7 @@ static void gfx_display_d3d9_cg_draw_pipeline(gfx_display_ctx_draw_t *draw,
                   0, sizeof(Vertex));
          }
 
-         draw->coords->vertices = ca->coords.vertices;
+         draw->coords->vertices = ca->vertices;
 
          /* Set pipeline blend state — ribbon uses multiplicative blend
           * (DESTCOLOR + ONE) matching D3D11's blend_pipeline. */
@@ -1287,6 +1291,18 @@ static void *d3d9_cg_font_init(void *data,
    }
 
    font->atlas      = font->font_driver->get_atlas(font->font_data);
+   /* The atlas may grow, up to the largest texture the device takes;
+    * the draw remakes the texture when the atlas's size has changed */
+   {
+      D3DCAPS9 caps;
+      if (     SUCCEEDED(IDirect3DDevice9_GetDeviceCaps(d3d->dev, &caps))
+            && caps.MaxTextureWidth  > 0
+            && caps.MaxTextureHeight > 0)
+      {
+         font->atlas->max_width  = caps.MaxTextureWidth;
+         font->atlas->max_height = caps.MaxTextureHeight;
+      }
+   }
    font->tex_width  = font->atlas->width;
    font->tex_height = font->atlas->height;
 
@@ -1342,37 +1358,14 @@ static void d3d9_cg_font_free(void *data, bool is_threaded)
    free(font);
 }
 
-static int d3d9_cg_font_get_message_width(void *data,
-      const char *msg, size_t msg_len, float scale)
+static int d3d9_cg_font_get_message_width(void *data, const char *msg,
+      size_t msg_len, float scale)
 {
-   size_t i;
-   int delta_x = 0;
-   const struct font_glyph *glyph_q = NULL;
-   d3d9_cg_font_t *font           = (d3d9_cg_font_t*)data;
-
+   d3d9_cg_font_t *font = (d3d9_cg_font_t*)data;
    if (!font)
       return 0;
-
-   glyph_q = font->font_driver->get_glyph(font->font_data, '?');
-
-   for (i = 0; i < msg_len; i++)
-   {
-      const struct font_glyph *glyph;
-      const char *msg_tmp = &msg[i];
-      unsigned    code    = utf8_walk(&msg_tmp);
-      unsigned    skip    = msg_tmp - &msg[i];
-
-      if (skip > 1)
-         i += skip - 1;
-
-      if (!(glyph = font->font_driver->get_glyph(font->font_data, code)))
-         if (!(glyph = glyph_q))
-            continue;
-
-      delta_x += glyph->advance_x;
-   }
-
-   return delta_x * scale;
+   return font_renderer_get_message_width(font->font_driver,
+         font->font_data, msg, msg_len, scale);
 }
 
 /* Emit a single glyph quad (6 vertices for two triangles)
@@ -1451,11 +1444,41 @@ static INLINE Vertex *d3d9_cg_font_get_scratch(
 }
 
 
+/* Draws @vert_count glyph vertices from @verts with the atlas bound,
+ * and puts the menu's vertex stream back. */
+static void d3d9_cg_font_draw_verts(d3d9_video_t *d3d, d3d9_cg_font_t *font,
+      Vertex *verts, unsigned vert_count)
+{
+   IDirect3DDevice9_SetTexture(d3d->dev, 0,
+         (IDirect3DBaseTexture9*)font->texture);
+   IDirect3DDevice9_SetSamplerState(d3d->dev,
+         0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+   IDirect3DDevice9_SetSamplerState(d3d->dev,
+         0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+   IDirect3DDevice9_SetSamplerState(d3d->dev,
+         0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+   IDirect3DDevice9_SetSamplerState(d3d->dev,
+         0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+
+   IDirect3DDevice9_DrawPrimitiveUP(d3d->dev,
+         D3DPT_TRIANGLELIST,
+         vert_count / 3,
+         verts,
+         sizeof(Vertex));
+
+   /* DrawPrimitiveUP unbinds stream source, re-bind for
+    * subsequent display draws in the same frame */
+   IDirect3DDevice9_SetStreamSource(d3d->dev, 0,
+         (LPDIRECT3DVERTEXBUFFER9)d3d->menu_display.buffer,
+         0, sizeof(Vertex));
+}
+
 static void d3d9_cg_font_render_msg(
       void *userdata, void *data,
       const char *msg, size_t msg_len,
       const struct font_params *params)
 {
+   font_params_resolved_t rp;
    float x, y, scale, drop_mod, drop_alpha;
    enum text_alignment text_align;
    int drop_x, drop_y;
@@ -1476,49 +1499,21 @@ static void d3d9_cg_font_render_msg(
    if (!width || !height)
       return;
 
-   if (params)
-   {
-      x          = params->x;
-      y          = params->y;
-      scale      = params->scale;
-      text_align = params->text_align;
-      drop_x     = params->drop_x;
-      drop_y     = params->drop_y;
-      drop_mod   = params->drop_mod;
-      drop_alpha = params->drop_alpha;
+   font_driver_resolve_params(params, &rp);
+   x          = rp.x;
+   y          = rp.y;
+   scale      = rp.scale;
+   text_align = rp.text_align;
+   drop_x     = rp.drop_x;
+   drop_y     = rp.drop_y;
+   drop_mod   = rp.drop_mod;
+   drop_alpha = rp.drop_alpha;
+   r          = rp.rgba[0];
+   g          = rp.rgba[1];
+   b          = rp.rgba[2];
+   alpha           = rp.rgba[3];
+   color      = D3DCOLOR_ARGB(alpha, r, g, b);
 
-      r          = FONT_COLOR_GET_RED(params->color);
-      g          = FONT_COLOR_GET_GREEN(params->color);
-      b          = FONT_COLOR_GET_BLUE(params->color);
-      alpha      = FONT_COLOR_GET_ALPHA(params->color);
-
-      color      = D3DCOLOR_ARGB(alpha, r, g, b);
-   }
-   else
-   {
-      settings_t *settings    = config_get_ptr();
-      float video_msg_pos_x   = settings->floats.video_msg_pos_x;
-      float video_msg_pos_y   = settings->floats.video_msg_pos_y;
-      float video_msg_color_r = settings->floats.video_msg_color_r;
-      float video_msg_color_g = settings->floats.video_msg_color_g;
-      float video_msg_color_b = settings->floats.video_msg_color_b;
-
-      x          = video_msg_pos_x;
-      y          = video_msg_pos_y;
-      scale      = 1.0f;
-      text_align = TEXT_ALIGN_LEFT;
-
-      r          = (unsigned)(video_msg_color_r * 255);
-      g          = (unsigned)(video_msg_color_g * 255);
-      b          = (unsigned)(video_msg_color_b * 255);
-      alpha      = 255;
-      color      = D3DCOLOR_ARGB(alpha, r, g, b);
-
-      drop_x     = -2;
-      drop_y     = -2;
-      drop_mod   = 0.3f;
-      drop_alpha = 1.0f;
-   }
 
    font->font_driver->get_line_metrics(font->font_data, &line_metrics);
    line_height = line_metrics->height * scale / height;
@@ -1548,6 +1543,12 @@ static void d3d9_cg_font_render_msg(
    }
 
    /* Update atlas texture if dirty */
+   /* Asked for before anything is laid out: it may have grown, which
+    * marks it dirty, and the texture is remade below at its new size
+    * before any texture coordinate is taken from it */
+   if (font->font_driver && font->font_data)
+      font->atlas = font->font_driver->get_atlas(font->font_data);
+
    if (font->atlas->dirty)
    {
       bool respecified = false;
@@ -1633,9 +1634,24 @@ static void d3d9_cg_font_render_msg(
    }
 
    {
-      int lines       = 0;
-      bool has_drop   = drop_x || drop_y;
-      const char *m   = msg;
+      bool has_drop                    = drop_x || drop_y;
+      bool line_ok                     = false;
+      Vertex *verts_s                  = NULL;
+      Vertex *verts_f                  = NULL;
+      unsigned vs                      = 0;
+      unsigned vf                      = 0;
+      int lx_s                         = 0;
+      int ly_s                         = 0;
+      int lx_f                         = 0;
+      int ly_f                         = 0;
+      float inv_vp_w                   = 0.0f;
+      float inv_vp_h                   = 0.0f;
+      float inv_tex_w                  = 0.0f;
+      float inv_tex_h                  = 0.0f;
+      const struct font_glyph* (*get_glyph)(void*, uint32_t)
+                                       = font->font_driver->get_glyph;
+      void *font_data                  = font->font_data;
+      const struct font_glyph *glyph_q = get_glyph(font_data, '?');
 
       if (has_drop)
       {
@@ -1646,254 +1662,85 @@ static void d3d9_cg_font_render_msg(
          color_dark          = D3DCOLOR_ARGB(alpha_dark, r_dark, g_dark, b_dark);
       }
 
-      for (;;)
-      {
-         const char *end = m;
-         size_t msg_len;
-
-         while (*end && *end != '\n')
-            end++;
-         msg_len = (size_t)(end - m);
-
-         if (msg_len > 0)
-         {
-            float line_y = y - (float)lines * line_height;
-
-            /* Drop shadow pass */
-            if (has_drop)
-            {
-               float drop_pos_x = x + scale * drop_x / (float)width;
-               float drop_pos_y = line_y + scale * drop_y / (float)height;
-         {
-            unsigned _i;
-            float _inv_vp_w, _inv_vp_h;
-            float _inv_tex_w, _inv_tex_h;
-            const struct font_glyph *_glyph_q = NULL;
-            unsigned _rl_width                 = VIDEO_SCALE_W(d3d->vp.full_dims);
-            unsigned _rl_height                = VIDEO_SCALE_H(d3d->vp.full_dims);
-            int _rx, _ry;
-            unsigned _vert_count               = 0;
-            Vertex *_verts                     = NULL;
-            const char *_rl_msg                = m;
-            size_t _rl_msg_len                 = msg_len;
-            float _rl_pos_x                    = drop_pos_x;
-            float _rl_pos_y                    = drop_pos_y;
-            D3DCOLOR _rl_color                 = color_dark;
-
-            if (_rl_width && _rl_height)
-            {
-               _verts = d3d9_cg_font_get_scratch(font, _rl_msg_len * 6);
-
-               if (_verts)
-               {
-                  _inv_vp_w  = 1.0f / (float)_rl_width;
-                  _inv_vp_h  = 1.0f / (float)_rl_height;
-                  _inv_tex_w = 1.0f / (float)font->tex_width;
-                  _inv_tex_h = 1.0f / (float)font->tex_height;
-                  _glyph_q   = font->font_driver->get_glyph(font->font_data, '?');
-
-                  /* Handle text alignment */
-                  if (text_align == TEXT_ALIGN_RIGHT || text_align == TEXT_ALIGN_CENTER)
-                  {
-                     int _width_accum = 0;
-                     const char *_scan = _rl_msg;
-                     const char *_scan_end = _rl_msg + _rl_msg_len;
-                     while (_scan < _scan_end)
-                     {
-                        const struct font_glyph *_glyph;
-                        uint32_t _code = utf8_walk(&_scan);
-                        if (!(_glyph = font->font_driver->get_glyph(font->font_data, _code)))
-                           if (!(_glyph = _glyph_q))
-                              continue;
-                        _width_accum += _glyph->advance_x;
-                     }
-                     if (text_align == TEXT_ALIGN_RIGHT)
-                        _rl_pos_x -= (float)(_width_accum * scale) / (float)_rl_width;
-                     else
-                        _rl_pos_x -= (float)(_width_accum * scale) / (float)_rl_width / 2.0f;
-                  }
-
-                  _rx = roundf(_rl_pos_x * _rl_width);
-                  _ry = roundf((1.0f - _rl_pos_y) * _rl_height);
-
-                  for (_i = 0; _i < _rl_msg_len; _i++)
-                  {
-                     const struct font_glyph *_glyph;
-                     const char *_msg_tmp = &_rl_msg[_i];
-                     unsigned    _code    = utf8_walk(&_msg_tmp);
-                     unsigned    _skip    = _msg_tmp - &_rl_msg[_i];
-
-                     if (_skip > 1)
-                        _i += _skip - 1;
-
-                     if (!(_glyph = font->font_driver->get_glyph(font->font_data, _code)))
-                        if (!(_glyph = _glyph_q))
-                           continue;
-
-                     _vert_count += d3d9_cg_font_emit_quad(
-                           &_verts[_vert_count],
-                           (_rx + _glyph->draw_offset_x * scale) * _inv_vp_w,
-                           (_ry + _glyph->draw_offset_y * scale) * _inv_vp_h,
-                           _glyph->width  * scale * _inv_vp_w,
-                           _glyph->height * scale * _inv_vp_h,
-                           _glyph->atlas_offset_x * _inv_tex_w,
-                           _glyph->atlas_offset_y * _inv_tex_h,
-                           _glyph->width  * _inv_tex_w,
-                           _glyph->height * _inv_tex_h,
-                           _rl_color);
-
-                     _rx += _glyph->advance_x * scale;
-                     _ry += _glyph->advance_y * scale;
-                  }
-
-                  if (_vert_count > 0)
-                  {
-                     IDirect3DDevice9_SetTexture(d3d->dev, 0,
-                           (IDirect3DBaseTexture9*)font->texture);
-                     IDirect3DDevice9_SetSamplerState(d3d->dev,
-                           0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
-                     IDirect3DDevice9_SetSamplerState(d3d->dev,
-                           0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
-                     IDirect3DDevice9_SetSamplerState(d3d->dev,
-                           0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
-                     IDirect3DDevice9_SetSamplerState(d3d->dev,
-                           0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
-
-                     IDirect3DDevice9_DrawPrimitiveUP(d3d->dev,
-                           D3DPT_TRIANGLELIST,
-                           _vert_count / 3,
-                           _verts,
-                           sizeof(Vertex));
-
-                     /* DrawPrimitiveUP unbinds stream source, re-bind for
-                      * subsequent display draws in the same frame */
-                     IDirect3DDevice9_SetStreamSource(d3d->dev, 0,
-                           (LPDIRECT3DVERTEXBUFFER9)d3d->menu_display.buffer,
-                           0, sizeof(Vertex));
-                  }
-               }
-            }
-         }
-            }
-
-            /* Main text pass */
-         {
-            unsigned _i;
-            float _inv_vp_w, _inv_vp_h;
-            float _inv_tex_w, _inv_tex_h;
-            const struct font_glyph *_glyph_q = NULL;
-            unsigned _rl_width                 = VIDEO_SCALE_W(d3d->vp.full_dims);
-            unsigned _rl_height                = VIDEO_SCALE_H(d3d->vp.full_dims);
-            int _rx, _ry;
-            unsigned _vert_count               = 0;
-            Vertex *_verts                     = NULL;
-            const char *_rl_msg                = m;
-            size_t _rl_msg_len                 = msg_len;
-            float _rl_pos_x                    = x;
-            float _rl_pos_y                    = line_y;
-            D3DCOLOR _rl_color                 = color;
-
-            if (_rl_width && _rl_height)
-            {
-               _verts = d3d9_cg_font_get_scratch(font, _rl_msg_len * 6);
-
-               if (_verts)
-               {
-                  _inv_vp_w  = 1.0f / (float)_rl_width;
-                  _inv_vp_h  = 1.0f / (float)_rl_height;
-                  _inv_tex_w = 1.0f / (float)font->tex_width;
-                  _inv_tex_h = 1.0f / (float)font->tex_height;
-                  _glyph_q   = font->font_driver->get_glyph(font->font_data, '?');
-
-                  /* Handle text alignment */
-                  if (text_align == TEXT_ALIGN_RIGHT || text_align == TEXT_ALIGN_CENTER)
-                  {
-                     int _width_accum = 0;
-                     const char *_scan = _rl_msg;
-                     const char *_scan_end = _rl_msg + _rl_msg_len;
-                     while (_scan < _scan_end)
-                     {
-                        const struct font_glyph *_glyph;
-                        uint32_t _code = utf8_walk(&_scan);
-                        if (!(_glyph = font->font_driver->get_glyph(font->font_data, _code)))
-                           if (!(_glyph = _glyph_q))
-                              continue;
-                        _width_accum += _glyph->advance_x;
-                     }
-                     if (text_align == TEXT_ALIGN_RIGHT)
-                        _rl_pos_x -= (float)(_width_accum * scale) / (float)_rl_width;
-                     else
-                        _rl_pos_x -= (float)(_width_accum * scale) / (float)_rl_width / 2.0f;
-                  }
-
-                  _rx = roundf(_rl_pos_x * _rl_width);
-                  _ry = roundf((1.0f - _rl_pos_y) * _rl_height);
-
-                  for (_i = 0; _i < _rl_msg_len; _i++)
-                  {
-                     const struct font_glyph *_glyph;
-                     const char *_msg_tmp = &_rl_msg[_i];
-                     unsigned    _code    = utf8_walk(&_msg_tmp);
-                     unsigned    _skip    = _msg_tmp - &_rl_msg[_i];
-
-                     if (_skip > 1)
-                        _i += _skip - 1;
-
-                     if (!(_glyph = font->font_driver->get_glyph(font->font_data, _code)))
-                        if (!(_glyph = _glyph_q))
-                           continue;
-
-                     _vert_count += d3d9_cg_font_emit_quad(
-                           &_verts[_vert_count],
-                           (_rx + _glyph->draw_offset_x * scale) * _inv_vp_w,
-                           (_ry + _glyph->draw_offset_y * scale) * _inv_vp_h,
-                           _glyph->width  * scale * _inv_vp_w,
-                           _glyph->height * scale * _inv_vp_h,
-                           _glyph->atlas_offset_x * _inv_tex_w,
-                           _glyph->atlas_offset_y * _inv_tex_h,
-                           _glyph->width  * _inv_tex_w,
-                           _glyph->height * _inv_tex_h,
-                           _rl_color);
-
-                     _rx += _glyph->advance_x * scale;
-                     _ry += _glyph->advance_y * scale;
-                  }
-
-                  if (_vert_count > 0)
-                  {
-                     IDirect3DDevice9_SetTexture(d3d->dev, 0,
-                           (IDirect3DBaseTexture9*)font->texture);
-                     IDirect3DDevice9_SetSamplerState(d3d->dev,
-                           0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
-                     IDirect3DDevice9_SetSamplerState(d3d->dev,
-                           0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
-                     IDirect3DDevice9_SetSamplerState(d3d->dev,
-                           0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
-                     IDirect3DDevice9_SetSamplerState(d3d->dev,
-                           0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
-
-                     IDirect3DDevice9_DrawPrimitiveUP(d3d->dev,
-                           D3DPT_TRIANGLELIST,
-                           _vert_count / 3,
-                           _verts,
-                           sizeof(Vertex));
-
-                     /* DrawPrimitiveUP unbinds stream source, re-bind for
-                      * subsequent display draws in the same frame */
-                     IDirect3DDevice9_SetStreamSource(d3d->dev, 0,
-                           (LPDIRECT3DVERTEXBUFFER9)d3d->menu_display.buffer,
-                           0, sizeof(Vertex));
-                  }
-               }
-            }
-         }
-         }
-
-         if (*end != '\n')
-            break;
-         m = end + 1;
-         lines++;
-      }
+      /* One pass per line: each glyph is looked up once and written
+       * to the line's shadow run and its foreground run, drawn in
+       * that order, the shadow behind. */
+#define D3D9_FONT_QUAD(dst, px, py, glyph, col) \
+      d3d9_cg_font_emit_quad(dst, \
+            ((px) + (glyph)->draw_offset_x * scale) * inv_vp_w, \
+            ((py) + (glyph)->draw_offset_y * scale) * inv_vp_h, \
+            (glyph)->width  * scale * inv_vp_w, \
+            (glyph)->height * scale * inv_vp_h, \
+            (glyph)->atlas_offset_x * inv_tex_w, \
+            (glyph)->atlas_offset_y * inv_tex_h, \
+            (glyph)->width  * inv_tex_w, \
+            (glyph)->height * inv_tex_h, \
+            col)
+#define FONT_LAYOUT_ALIGNED (text_align == TEXT_ALIGN_RIGHT \
+            || text_align == TEXT_ALIGN_CENTER)
+#define FONT_LAYOUT_SKIP(line, bytes) ((bytes) == 0)
+#define FONT_LAYOUT_LINE(line, line_width, count, bytes) \
+      do \
+      { \
+         float line_y = y - (float)(line) * line_height; \
+         float fx     = x; \
+         (void)(count); \
+         vs = vf = 0; \
+         line_ok = !!(verts_s = d3d9_cg_font_get_scratch(font, (bytes) * 12)); \
+         if (!line_ok) \
+            break; \
+         verts_f   = verts_s + (bytes) * 6; \
+         inv_vp_w  = 1.0f / (float)width; \
+         inv_vp_h  = 1.0f / (float)height; \
+         inv_tex_w = 1.0f / (float)font->tex_width; \
+         inv_tex_h = 1.0f / (float)font->tex_height; \
+         if (text_align == TEXT_ALIGN_RIGHT) \
+            fx -= (float)((line_width) * scale) / (float)width; \
+         else if (text_align == TEXT_ALIGN_CENTER) \
+            fx -= (float)((line_width) * scale) / (float)width / 2.0f; \
+         lx_f = roundf(fx * width); \
+         ly_f = roundf((1.0f - line_y) * height); \
+         if (has_drop) \
+         { \
+            float sx = x + scale * drop_x / (float)width; \
+            if (text_align == TEXT_ALIGN_RIGHT) \
+               sx -= (float)((line_width) * scale) / (float)width; \
+            else if (text_align == TEXT_ALIGN_CENTER) \
+               sx -= (float)((line_width) * scale) / (float)width / 2.0f; \
+            lx_s = roundf(sx * width); \
+            ly_s = roundf((1.0f - (line_y + scale * drop_y \
+                        / (float)height)) * height); \
+         } \
+      } while (0)
+#define FONT_LAYOUT_GLYPH(glyph, pen_x, pen_y) \
+      do \
+      { \
+         /* This driver keeps its own truncating pens */ \
+         (void)(pen_x); \
+         (void)(pen_y); \
+         if (!line_ok) \
+            break; \
+         if (has_drop) \
+         { \
+            vs   += D3D9_FONT_QUAD(&verts_s[vs], lx_s, ly_s, glyph, \
+                  color_dark); \
+            lx_s += (glyph)->advance_x * scale; \
+            ly_s += (glyph)->advance_y * scale; \
+         } \
+         vf   += D3D9_FONT_QUAD(&verts_f[vf], lx_f, ly_f, glyph, color); \
+         lx_f += (glyph)->advance_x * scale; \
+         ly_f += (glyph)->advance_y * scale; \
+      } while (0)
+#define FONT_LAYOUT_LINE_END() \
+      do \
+      { \
+         if (vs) \
+            d3d9_cg_font_draw_verts(d3d, font, verts_s, vs); \
+         if (vf) \
+            d3d9_cg_font_draw_verts(d3d, font, verts_f, vf); \
+      } while (0)
+#include "../font_layout.h"
+#undef D3D9_FONT_QUAD
    }
 
 }
@@ -3942,15 +3789,10 @@ static bool d3d9_cg_init_internal(d3d9_video_t *d3d,
 
 #ifdef HAVE_WINDOW
    memset(&d3d->windowClass, 0, sizeof(d3d->windowClass));
-   d3d->windowClass.lpfnWndProc = wnd_proc_d3d_common;
-#ifdef HAVE_DINPUT
-   if (string_is_equal(settings->arrays.input_driver, "dinput"))
-      d3d->windowClass.lpfnWndProc = wnd_proc_d3d_dinput;
-#endif
-#ifdef HAVE_WINRAWINPUT
-   if (string_is_equal(settings->arrays.input_driver, "raw"))
-      d3d->windowClass.lpfnWndProc = wnd_proc_d3d_winraw;
-#endif
+   /* one window procedure for every video and input driver; the
+    * family says what creating the window sets up */
+   d3d->windowClass.lpfnWndProc = win32_window_proc;
+   win32_window_proc_setup(WIN32_WINDOW_D3D);
    win32_window_init(&d3d->windowClass, true, NULL);
 #endif
 
@@ -4020,8 +3862,9 @@ static bool d3d9_cg_init_internal(d3d9_video_t *d3d,
    if (!d3d9_cg_initialize(d3d, &d3d->video_info))
       return false;
 
-   d3d_input_driver(settings->arrays.input_joypad_driver,
-      settings->arrays.input_joypad_driver, input, input_data);
+   /* no input driver of this driver's own: the frontend starts the
+    * one that goes with a Windows window */
+   input_driver_left_to_frontend(INPUT_WINDOW_WINDOWS, input, input_data);
 
    {
       char version_str[128];
@@ -4799,6 +4642,21 @@ static unsigned d3d9_cg_get_swap_interval_cap(void *data)
    return 4;
 }
 
+/* The vblank the most recent present went out on, for display pacing:
+ * Direct3D 9 has no frame statistics to say, so the compositor's own
+ * last vblank, as the other Windows drivers read it when theirs do not.
+ * 0 where there is no compositor to ask, and the presenter keeps its
+ * own clock. */
+static retro_time_t d3d9_cg_get_last_present_time(void *data)
+{
+   (void)data;
+#if !defined(__WINRT__) && !defined(_XBOX)
+   return win32_dwm_last_vblank_time();
+#else
+   return 0;
+#endif
+}
+
 static const video_poke_interface_t d3d9_cg_poke_interface = {
    d3d9_cg_get_flags,
    d3d9_cg_load_texture,
@@ -4834,7 +4692,7 @@ static const video_poke_interface_t d3d9_cg_poke_interface = {
    d3d9_supports_texture_format,
    d3d9_load_texture_compressed,
    NULL, /* present_last */
-   NULL, /* get_last_present_time */
+   d3d9_cg_get_last_present_time,
    NULL, /* hw_ring_install */
    NULL, /* hw_ring_fence_new */
    NULL, /* hw_ring_fence_free */

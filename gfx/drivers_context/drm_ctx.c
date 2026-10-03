@@ -1367,40 +1367,9 @@ static void gfx_ctx_drm_input_driver(void *data,
       const char *joypad_name,
       input_driver_t **input, void **input_data)
 {
-   settings_t *settings = config_get_ptr();
-
-   /* We cannot use the X11 input driver for DRM/KMS, and udev may be restricted */
-   if (   string_is_equal(settings->arrays.input_driver, "x")
-       || string_is_equal(settings->arrays.input_driver, "udev"))
-   {
-#ifdef HAVE_UDEV
-      {
-         /* Try to set it to udev */
-         void *udev = input_driver_init_wrap(&input_udev, joypad_name);
-         if (udev)
-         {
-            *input       = &input_udev;
-            *input_data  = udev;
-            return;
-         }
-      }
-#endif
-#if defined(__linux__) && !defined(ANDROID)
-      {
-         /* Try to set it to linuxraw if not available or failed to initialize */
-         void *linuxraw = input_driver_init_wrap(&input_linuxraw, joypad_name);
-         if (linuxraw)
-         {
-            *input       = &input_linuxraw;
-            *input_data  = linuxraw;
-            return;
-         }
-      }
-#endif
-   }
-
-   *input      = NULL;
-   *input_data = NULL;
+   /* no input driver of this context's own: the frontend starts the
+    * one that goes with a display that has no window system */
+   input_driver_left_to_frontend(INPUT_WINDOW_KMS, input, input_data);
 }
 
 static bool gfx_ctx_drm_has_focus(void *data) { return true; }

@@ -32,6 +32,10 @@
 #include "config.h"
 #endif
 
+#ifdef HAVE_SSL
+#include <net/net_socket_ssl.h>
+#endif
+
 #include "file_path_special.h"
 #include "command.h"
 #include "configuration.h"
@@ -1012,7 +1016,7 @@ struct config_path_setting
 
 /* Forward declarations */
 #ifdef HAVE_CONFIGFILE
-static void config_parse_file(global_t *global);
+static void config_parse_file(void);
 static size_t config_get_credentials_path(char *s, size_t len);
 static bool config_save_credentials(
       config_file_t *main_conf,
@@ -2297,7 +2301,7 @@ static struct config_bool_setting *populate_settings_bool(
 #include "settings/settings_def_cheevos_account.h"
 #include "settings/settings_def_menu_show_restart.h"
 #include "settings/settings_def_quit_restart.h"
-#include "settings/settings_def_menu_throttle.h"
+#include "settings/settings_def_menu_frame_rate.h"
 #include "settings/settings_def_video_ctx_scaling.h"
 #include "settings/settings_def_input_sensors_extra.h"
 #ifdef HAVE_NETWORKING
@@ -2823,6 +2827,12 @@ static struct config_bool_setting *populate_settings_bool(
 #undef S_UINT_AT_EX_NS_H
    SETTING_BOOL("video_scanline_sync",           &settings->bools.video_scanline_sync, true, DEFAULT_SCANLINE_SYNC, false);
    SETTING_BOOL("video_notch_write_over_enable", &settings->bools.video_notch_write_over_enable, true, DEFAULT_NOTCH_WRITE_OVER_ENABLE, false);
+#ifdef HAVE_PSGL
+   SETTING_BOOL("pal60_enable",                  &settings->bools.video_pal60_enable, true, DEFAULT_PAL60_ENABLE, false);
+#endif
+#if defined(_XBOX1) || defined(HW_RVL)
+   SETTING_BOOL("soft_filter_enable",            &settings->bools.video_soft_filter, true, DEFAULT_SOFT_FILTER, false);
+#endif
 #if defined(__APPLE__) && defined(HAVE_VULKAN)
    SETTING_BOOL("video_use_metal_arg_buffers",   &settings->bools.video_use_metal_arg_buffers, true, config_metal_arg_buffers_default(), false);
 #endif
@@ -2909,6 +2919,11 @@ static struct config_bool_setting *populate_settings_bool(
    SETTING_BOOL("netplay_request_device_p16",    &settings->bools.netplay_request_devices[15], true, false, false);
 #endif
 
+#ifdef ANDROID
+   SETTING_BOOL("input_stylus_enable", &settings->bools.input_stylus_enable, true, true, false);
+   SETTING_BOOL("input_stylus_require_contact_for_click", &settings->bools.input_stylus_require_contact_for_click, true, true, false);
+   SETTING_BOOL("input_stylus_hover_moves_pointer", &settings->bools.input_stylus_hover_moves_pointer, true, true, false);
+#endif
 
 #ifdef _3DS
    SETTING_BOOL("new3ds_speedup_enable",         &settings->bools.new3ds_speedup_enable, true, DEFAULT_NEW_3DS_SPEEDUP_ENABLE,      false);
@@ -3007,7 +3022,7 @@ static struct config_float_setting *populate_settings_float(
 #include "settings/settings_def_cheevos_account.h"
 #include "settings/settings_def_menu_show_restart.h"
 #include "settings/settings_def_quit_restart.h"
-#include "settings/settings_def_menu_throttle.h"
+#include "settings/settings_def_menu_frame_rate.h"
 #include "settings/settings_def_video_ctx_scaling.h"
 #include "settings/settings_def_input_sensors_extra.h"
 #ifdef HAVE_NETWORKING
@@ -3623,6 +3638,17 @@ static struct config_uint_setting *populate_settings_uint(
 #ifdef GEKKO
    SETTING_UINT("video_viwidth",                    &settings->uints.video_viwidth, true, DEFAULT_VIDEO_VI_WIDTH, false);
 #endif
+#if defined(GEKKO) || defined(_XBOX360)
+   SETTING_UINT("gamma_correction",                 &settings->uints.video_gamma, true, DEFAULT_GAMMA, false);
+#endif
+#ifdef PS2
+   /* An entry of the PS2 driver's mode table: its modes are told apart
+    * by more than their size. */
+   SETTING_UINT("current_resolution_id",            &settings->uints.video_ps2_mode, true, 0, false);
+#endif
+#ifdef _XBOX1
+   SETTING_UINT("flicker_filter_index",             &settings->uints.video_flicker_filter, true, DEFAULT_FLICKER_FILTER, false);
+#endif
    /* GENERATED: single-source setting rows (uint kind emits here) */
 #define S_BOOL(f, T, n, d, sd, df, c, us, sub)
 #define S_BOOL_NS(f, T, n, d, sd, df, c, us)
@@ -3693,7 +3719,7 @@ static struct config_uint_setting *populate_settings_uint(
 #include "settings/settings_def_cheevos_account.h"
 #include "settings/settings_def_menu_show_restart.h"
 #include "settings/settings_def_quit_restart.h"
-#include "settings/settings_def_menu_throttle.h"
+#include "settings/settings_def_menu_frame_rate.h"
 #include "settings/settings_def_video_ctx_scaling.h"
 #include "settings/settings_def_input_sensors_extra.h"
 #ifdef HAVE_NETWORKING
@@ -4229,9 +4255,10 @@ static struct config_uint_setting *populate_settings_uint(
 #endif
 
 #ifdef ANDROID
-   SETTING_UINT("input_sensor_orientation", &settings->uints.input_sensor_orientation, true, 0, false);
+   SETTING_UINT("input_stylus_pressure_sensitivity", &settings->uints.input_stylus_pressure_sensitivity, true, DEFAULT_INPUT_STYLUS_PRESSURE_SENSITIVITY, false);
+   SETTING_UINT("input_sensor_orientation",          &settings->uints.input_sensor_orientation, true, 0, false);
 #else
-   SETTING_UINT("input_sensor_orientation", &settings->uints.input_sensor_orientation, true, 1, false);
+   SETTING_UINT("input_sensor_orientation",          &settings->uints.input_sensor_orientation, true, 1, false);
 #endif
 
 #if defined(HAVE_OVERLAY)
@@ -4423,7 +4450,7 @@ static struct config_int_setting *populate_settings_int(
 #include "settings/settings_def_cheevos_account.h"
 #include "settings/settings_def_menu_show_restart.h"
 #include "settings/settings_def_quit_restart.h"
-#include "settings/settings_def_menu_throttle.h"
+#include "settings/settings_def_menu_frame_rate.h"
 #include "settings/settings_def_video_ctx_scaling.h"
 #include "settings/settings_def_input_sensors_extra.h"
 #ifdef HAVE_NETWORKING
@@ -5018,7 +5045,7 @@ static struct config_int_setting *populate_settings_int(
 #include "settings/settings_def_cheevos_account.h"
 #include "settings/settings_def_menu_show_restart.h"
 #include "settings/settings_def_quit_restart.h"
-#include "settings/settings_def_menu_throttle.h"
+#include "settings/settings_def_menu_frame_rate.h"
 #include "settings/settings_def_video_ctx_scaling.h"
 #include "settings/settings_def_input_sensors_extra.h"
 #ifdef HAVE_NETWORKING
@@ -5573,18 +5600,6 @@ static struct config_int_setting *populate_settings_int(
    return tmp;
 }
 
-static void video_driver_default_settings(global_t *global)
-{
-   if (!global)
-      return;
-
-   global->console.screen.gamma_correction       = DEFAULT_GAMMA;
-   global->console.flickerfilter_enable          = false;
-   global->console.softfilter_enable             = false;
-
-   global->console.screen.resolutions.current.id = 0;
-}
-
 /* Moves built-in playlists from legacy location to 'playlists/builtin' */
 #define CONFIG_PLAYLIST_MIGRATION(playlist_path, playlist_tag) \
 { \
@@ -5620,13 +5635,12 @@ static void video_driver_default_settings(global_t *global)
  *
  * Set 'default' configuration values.
  **/
-void config_set_defaults(void *data, settings_t *target)
+void config_set_defaults(settings_t *target)
 {
    size_t i;
 #ifdef HAVE_MENU
    static bool first_initialized   = true;
 #endif
-   global_t *global                 = (global_t*)data;
    settings_t *settings             = target;
    recording_state_t *recording_st  = recording_state_get_ptr();
    int bool_settings_size           = SETTINGS_BOOL_COUNT_MAX;
@@ -5942,6 +5956,7 @@ void config_set_defaults(void *data, settings_t *target)
       settings->uints.input_analog_dpad_mode[i] = ANALOG_DPAD_LSTICK;
       input_config_set_device((unsigned)i, RETRO_DEVICE_JOYPAD);
       settings->uints.input_mouse_index[i] = (unsigned)i;
+      settings->uints.input_keyboard_index[i] = 0;
    }
 
    custom_vp->dims   = 0;
@@ -6014,8 +6029,6 @@ void config_set_defaults(void *data, settings_t *target)
    *settings->paths.path_audio_dsp_plugin = '\0';
 
    *settings->paths.log_dir = '\0';
-
-   video_driver_default_settings(global);
 
    if (*g_defaults.dirs[DEFAULT_DIR_WALLPAPERS])
       configuration_set_string(settings,
@@ -6315,12 +6328,11 @@ void config_set_defaults(void *data, settings_t *target)
  * Loads a config file and reads all the values into memory.
  *
  */
-void config_load(void *data)
+void config_load(void)
 {
-   global_t *global = (global_t*)data;
-   config_set_defaults(global, config_st);
+   config_set_defaults(config_st);
 #ifdef HAVE_CONFIGFILE
-   config_parse_file(global);
+   config_parse_file();
 #endif
 }
 
@@ -6562,35 +6574,6 @@ static config_file_t *open_default_config_file(void)
    return conf;
 }
 
-#ifdef RARCH_CONSOLE
-static void video_driver_load_settings(global_t *global,
-      config_file_t *conf)
-{
-   bool               tmp_bool = false;
-
-   CONFIG_GET_INT_BASE(conf, global,
-         console.screen.gamma_correction, "gamma_correction");
-
-   if (config_get_bool(conf, "flicker_filter_enable",
-         &tmp_bool))
-      global->console.flickerfilter_enable = tmp_bool;
-
-   if (config_get_bool(conf, "soft_filter_enable",
-         &tmp_bool))
-      global->console.softfilter_enable = tmp_bool;
-
-   CONFIG_GET_INT_BASE(conf, global,
-         console.screen.soft_filter_index,
-         "soft_filter_index");
-   CONFIG_GET_INT_BASE(conf, global,
-         console.screen.resolutions.current.id,
-         "current_resolution_id");
-   CONFIG_GET_INT_BASE(conf, global,
-         console.screen.flicker_filter_index,
-         "flicker_filter_index");
-}
-#endif
-
 static void check_verbosity_settings(config_file_t *conf,
       settings_t *settings)
 {
@@ -6630,6 +6613,19 @@ static void check_verbosity_settings(config_file_t *conf,
    }
 }
 
+/* Turbo Bind and Turbo Button index the remap and bind tables
+ * directly, so a value read from a config or remap file has to stay
+ * inside their menu ranges: Turbo Bind is -1 (empty) or a RetroPad
+ * ID up to the analog binds, Turbo Button a digital RetroPad ID. */
+static void config_sanitize_turbo_binds(settings_t *settings)
+{
+   if (     settings->ints.input_turbo_bind < -1
+         || settings->ints.input_turbo_bind >= RARCH_ANALOG_BIND_LIST_END)
+      settings->ints.input_turbo_bind     = DEFAULT_TURBO_BIND;
+   if (settings->uints.input_turbo_button >= RARCH_FIRST_CUSTOM_BIND)
+      settings->uints.input_turbo_button  = DEFAULT_TURBO_BUTTON;
+}
+
 /**
  * config_load:
  * @path                : path to be read from.
@@ -6639,8 +6635,7 @@ static void check_verbosity_settings(config_file_t *conf,
  * Loads a config file and reads all the values into memory.
  *
  */
-static bool config_load_file(global_t *global,
-      const char *path, settings_t *settings)
+static bool config_load_file(const char *path, settings_t *settings)
 {
    unsigned i;
    char tmp_str[PATH_MAX_LENGTH];
@@ -6964,6 +6959,9 @@ static bool config_load_file(global_t *global,
          strlcpy_lit(prefix + _len, "_mouse_index", sizeof(prefix) - _len);
          CONFIG_GET_INT_BASE(conf, settings, uints.input_mouse_index[i], prefix);
 
+         strlcpy_lit(prefix + _len, "_keyboard_index", sizeof(prefix) - _len);
+         CONFIG_GET_INT_BASE(conf, settings, uints.input_keyboard_index[i], prefix);
+
          strlcpy_lit(prefix + _len, "_joypad_index", sizeof(prefix) - _len);
          CONFIG_GET_INT_BASE(conf, settings, uints.input_joypad_index[i], prefix);
 
@@ -7035,11 +7033,6 @@ static bool config_load_file(global_t *global,
    if (config_get_path(conf, "libretro_directory", tmp_str, sizeof(tmp_str)))
       configuration_set_string(settings,
             settings->paths.directory_libretro, tmp_str);
-#endif
-
-#ifdef RARCH_CONSOLE
-   if (conf)
-      video_driver_load_settings(global, conf);
 #endif
 
    /* Post-settings load */
@@ -7387,6 +7380,22 @@ static bool config_load_file(global_t *global,
    }
 #endif
 
+   config_sanitize_turbo_binds(settings);
+
+   /* Menu Frame Rate took over from Throttle Menu Framerate, which
+    * only acted with Sync to Exact Content Framerate on, where its
+    * default held the menu to the content's rate. A configuration
+    * written before carries that choice; keep it. */
+   if (     settings->bools.vrr_runloop_enable
+         && !config_get_entry(conf, MENU_ENUM_LABEL_MENU_FRAME_RATE_STR))
+   {
+      bool menu_throttle = true;
+      config_get_bool(conf, "menu_throttle_framerate", &menu_throttle);
+      if (menu_throttle)
+         configuration_set_uint(settings,
+               settings->uints.menu_frame_rate, MENU_FRAME_RATE_CONTENT);
+   }
+
 #ifdef HAVE_CHEEVOS
    if (*settings->arrays.cheevos_leaderboards_enable)
    {
@@ -7592,6 +7601,18 @@ static bool config_load_file(global_t *global,
       }
    }
 
+#ifdef HAVE_SSL
+   /* Every load of the live settings comes through here: startup, a
+    * per-core or per-game override, and its unload. Hand the TLS
+    * verification mode to the SSL backend each time, so an override
+    * that changes it applies now, not after a restart. Only for the
+    * live settings: config_save_overrides() loads the base config into
+    * a scratch copy to diff against, and its mode must not reach the
+    * backend while the override's stays on screen. */
+   if (settings == config_st)
+      ssl_socket_set_verify_mode(settings->uints.tls_verify_mode);
+#endif
+
    if (conf)
       config_file_free(conf);
    if (bool_settings)
@@ -7779,7 +7800,7 @@ bool config_load_override(void *data)
    retroarch_override_setting_unset(RARCH_OVERRIDE_SETTING_STATE_PATH, NULL);
    retroarch_override_setting_unset(RARCH_OVERRIDE_SETTING_SAVE_PATH, NULL);
 
-   if (!config_load_file(global_get_ptr(), path_get(RARCH_PATH_CONFIG), settings))
+   if (!config_load_file(path_get(RARCH_PATH_CONFIG), settings))
       return false;
 
    a = path_get(RARCH_PATH_CONFIG_OVERRIDE);
@@ -7824,7 +7845,7 @@ bool config_load_override_file(const char *config_path)
    retroarch_override_setting_unset(RARCH_OVERRIDE_SETTING_STATE_PATH, NULL);
    retroarch_override_setting_unset(RARCH_OVERRIDE_SETTING_SAVE_PATH, NULL);
 
-   if (!config_load_file(global_get_ptr(), path_get(RARCH_PATH_CONFIG), settings))
+   if (!config_load_file(path_get(RARCH_PATH_CONFIG), settings))
       return false;
 
    if (settings->bools.notification_show_config_override_load)
@@ -7959,12 +7980,12 @@ bool config_unload_override(void)
    {
       input_autoconf_backup_t bkp;
       bool have_bkp = input_autoconf_state_save(&bkp);
-      config_set_defaults(global_get_ptr(), config_st);
+      config_set_defaults(config_st);
       if (have_bkp)
          input_autoconf_state_restore(&bkp);
    }
 
-   if (!config_load_file(global_get_ptr(),
+   if (!config_load_file(
             path_get(RARCH_PATH_CONFIG), config_st))
       return false;
 
@@ -8149,100 +8170,14 @@ success:
  * Loads a config file and reads all the values into memory.
  *
  */
-static void config_parse_file(global_t *global)
+static void config_parse_file(void)
 {
    const char *config_path = path_get(RARCH_PATH_CONFIG);
 
-   if (!config_load_file(global, config_path, config_st))
+   if (!config_load_file(config_path, config_st))
    {
       RARCH_ERR("[Config] Config not found at: \"%s\".\n",
             config_path);
-   }
-}
-
-static void video_driver_save_settings(global_t *global, config_file_t *conf,
-      bool minimal, global_t *defaults_global)
-{
-   /* gamma_correction */
-   if (   !minimal
-       || global->console.screen.gamma_correction !=
-          (defaults_global ? defaults_global->console.screen.gamma_correction : DEFAULT_GAMMA))
-   {
-      config_set_int(conf, "gamma_correction",
-            global->console.screen.gamma_correction);
-   }
-   else
-   {
-      config_unset(conf, "gamma_correction");
-   }
-
-   /* flicker_filter_enable */
-   if (   !minimal
-       || global->console.flickerfilter_enable !=
-          (defaults_global ? defaults_global->console.flickerfilter_enable : false))
-   {
-      config_set_string(conf, "flicker_filter_enable",
-              global->console.flickerfilter_enable
-            ? "true"
-            : "false");
-   }
-   else
-   {
-      config_unset(conf, "flicker_filter_enable");
-   }
-
-   /* soft_filter_enable */
-   if (   !minimal
-       || global->console.softfilter_enable !=
-          (defaults_global ? defaults_global->console.softfilter_enable : false))
-   {
-      config_set_string(conf, "soft_filter_enable",
-              global->console.softfilter_enable
-            ? "true"
-            : "false");
-   }
-   else
-   {
-      config_unset(conf, "soft_filter_enable");
-   }
-
-   /* soft_filter_index */
-   if (   !minimal
-       || global->console.screen.soft_filter_index !=
-          (defaults_global ? defaults_global->console.screen.soft_filter_index : 0))
-   {
-      config_set_int(conf, "soft_filter_index",
-            global->console.screen.soft_filter_index);
-   }
-   else
-   {
-      config_unset(conf, "soft_filter_index");
-   }
-
-   /* current_resolution_id */
-   if (   !minimal
-       || global->console.screen.resolutions.current.id !=
-          (defaults_global ? defaults_global->console.screen.resolutions.current.id : 0))
-   {
-      config_set_int(conf, "current_resolution_id",
-            global->console.screen.resolutions.current.id);
-   }
-   else
-   {
-      config_unset(conf, "current_resolution_id");
-   }
-
-   /* flicker_filter_index */
-   if (   !minimal
-       || global->console.screen.flicker_filter_index !=
-          (defaults_global ? defaults_global->console.screen.flicker_filter_index : 0))
-   {
-      config_set_int(conf, "flicker_filter_index",
-            global->console.screen.flicker_filter_index);
-   }
-   else
-   {
-      config_unset(conf, "flicker_filter_index");
    }
 }
 
@@ -8620,12 +8555,14 @@ void config_get_autoconf_profile_filename(
 /**
  * config_save_autoconf_profile:
  * @device_name       : Input device name
- * @user              : Controller number to save
- * Writes a controller autoconf file to disk.
+ * @user              : Port whose binds are saved
+ * Writes a controller autoconf file to disk for the
+ * device assigned to @user.
  **/
 bool config_save_autoconf_profile(const char *device_name, unsigned user)
 {
    unsigned i;
+   unsigned dev;
    char buf[PATH_MAX_LENGTH];
    char autoconf_file[PATH_MAX_LENGTH];
    const char *a = NULL;
@@ -8639,11 +8576,17 @@ bool config_save_autoconf_profile(const char *device_name, unsigned user)
    const char *joypad_driver_fallback   = settings->arrays.input_joypad_driver;
    const char *joypad_driver            = NULL;
 
-   if (!device_name || !*device_name)
+   if (!device_name || !*device_name || user >= MAX_USERS)
+      return false;
+
+   /* Binds and their labels are per port; the device's
+    * driver, identity and autoconf binds are per device */
+   dev = settings->uints.input_joypad_index[user];
+   if (dev >= MAX_USERS)
       return false;
 
    /* Get currently set joypad driver */
-   joypad_driver = input_config_get_device_joypad_driver(user);
+   joypad_driver = input_config_get_device_joypad_driver(dev);
    if (!joypad_driver || !*joypad_driver)
    {
       /* This cannot happen, but if we reach this
@@ -8656,8 +8599,18 @@ bool config_save_autoconf_profile(const char *device_name, unsigned user)
    }
 
    /* Generate autoconfig file path */
-   config_get_autoconf_profile_filename(device_name, user, buf, sizeof(buf));
+   config_get_autoconf_profile_filename(device_name, dev, buf, sizeof(buf));
    fill_pathname_join_special(autoconf_file, autoconf_dir, buf, sizeof(autoconf_file));
+
+   /* The directory only exists once profiles have been
+    * downloaded or bundled */
+   if (     *autoconf_dir
+         && !path_is_directory(autoconf_dir)
+         && !path_mkdir(autoconf_dir))
+   {
+      RARCH_ERR("[Autoconf] Failed creating directory \"%s\".\n", autoconf_dir);
+      return false;
+   }
 
    /* Open config file */
    if (     !(conf = config_file_new_from_path_to_string(autoconf_file))
@@ -8673,9 +8626,9 @@ bool config_save_autoconf_profile(const char *device_name, unsigned user)
    for (i = 0; i < RARCH_ANALOG_BIND_LIST_END; i++)
    {
       struct retro_keybind *bind      = &input_config_binds[user][i];
-      struct retro_keybind *auto_bind = &input_autoconf_binds[user][i];
+      struct retro_keybind *auto_bind = &input_autoconf_binds[dev][i];
       struct input_bind_label *lbl    = &input_config_bind_labels[user][i];
-      struct input_bind_label *albl   = &input_autoconf_bind_labels[user][i];
+      struct input_bind_label *albl   = &input_autoconf_bind_labels[dev][i];
 
       if (bind->joykey == NO_BTN && auto_bind->joykey != NO_BTN)
       {
@@ -8725,16 +8678,13 @@ bool config_save_autoconf_profile(const char *device_name, unsigned user)
    config_set_string(conf, "input_driver",
          joypad_driver);
    config_set_string(conf, "input_device",
-         input_config_get_device_name(settings->uints.input_joypad_index[user]));
-   a =
-input_config_get_device_display_name(settings->uints.input_joypad_index[user]);
+         input_config_get_device_name(dev));
+   a = input_config_get_device_display_name(dev);
    config_set_string(conf, "input_device_display_name",
-         (a && *a)
-            ? a
-            : input_config_get_device_name(settings->uints.input_joypad_index[user]));
+         (a && *a) ? a : input_config_get_device_name(dev));
 
-   pid_user = input_config_get_device_pid(settings->uints.input_joypad_index[user]);
-   vid_user = input_config_get_device_vid(settings->uints.input_joypad_index[user]);
+   pid_user = input_config_get_device_pid(dev);
+   vid_user = input_config_get_device_vid(dev);
 
    if (pid_user && vid_user)
    {
@@ -8766,12 +8716,14 @@ input_config_get_device_display_name(settings->uints.input_joypad_index[user]);
          {
             save_keybind_joykey_label(conf, "input", input_config_bind_map_get_base(id), lbl);
             free(lbl->joykey);
+            lbl->joykey = NULL;
          }
 
          if (lbl->joyaxis && *lbl->joyaxis)
          {
             save_keybind_axis_label(conf, "input", input_config_bind_map_get_base(id), lbl);
             free(lbl->joyaxis);
+            lbl->joyaxis = NULL;
          }
       }
    }
@@ -9077,7 +9029,6 @@ bool config_save_file(const char *path)
    uint32_t flags                                    = runloop_get_flags();
    config_file_t                              *conf  = config_file_new_from_path_to_string(path);
    settings_t                              *settings = config_st;
-   global_t *global                                  = global_get_ptr();
    int bool_settings_size                            = SETTINGS_BOOL_COUNT_MAX;
    int float_settings_size                           = SETTINGS_FLOAT_COUNT_MAX;
    int int_settings_size                             = SETTINGS_INT_COUNT_MAX;
@@ -9162,7 +9113,7 @@ bool config_save_file(const char *path)
             /* Populate the local defaults struct directly: config_st
              * stays what every other thread's config_get_ptr() returns.
              * input_config_reset() inside sets the default keybinds. */
-            config_set_defaults(global, defaults);
+            config_set_defaults(defaults);
 
             /* Capture default keybinds (set by input_config_reset() in config_set_defaults) */
             memcpy(defaults_binds, input_config_binds, MAX_USERS * sizeof(retro_keybind_set));
@@ -9508,10 +9459,20 @@ bool config_save_file(const char *path)
       else
          config_unset(conf, cfg);
 
+      strlcpy_lit(cfg + _len, "_keyboard_index",    sizeof(cfg) - _len);
+      if (   !minimal
+          || settings->uints.input_keyboard_index[i] != defaults->uints.input_keyboard_index[i])
+         config_set_int(conf, cfg, settings->uints.input_keyboard_index[i]);
+      else
+         config_unset(conf, cfg);
+
+      /* What the user configured, which is not what the setting holds
+       * while a driver restart has put controllers back on their
+       * ports. */
       strlcpy_lit(cfg + _len, "_joypad_index",      sizeof(cfg) - _len);
       if (   !minimal
-          || settings->uints.input_joypad_index[i] != defaults->uints.input_joypad_index[i])
-         config_set_int(conf, cfg, settings->uints.input_joypad_index[i]);
+          || input_config_get_saved_joypad_index(i) != defaults->uints.input_joypad_index[i])
+         config_set_int(conf, cfg, input_config_get_saved_joypad_index(i));
       else
          config_unset(conf, cfg);
 
@@ -9651,9 +9612,6 @@ bool config_save_file(const char *path)
       }
    }
 
-   if (conf)
-      video_driver_save_settings(global, conf, minimal, NULL);
-
 #ifdef HAVE_LAKKA
    if (settings->bools.ssh_enable)
       filestream_close(filestream_open(LAKKA_SSH_PATH,
@@ -9694,6 +9652,15 @@ bool config_save_file(const char *path)
    /* Remove unused "quit_press_twice" after migrating to "confirm_quit" */
    {
       const char *tmp_key = "quit_press_twice";
+      struct config_entry_list *tmp = config_get_entry(conf, tmp_key);
+      if (tmp)
+         config_unset(conf, tmp->key);
+   }
+
+   /* Remove unused "menu_throttle_framerate" after migrating to
+    * "menu_frame_rate" */
+   {
+      const char *tmp_key = "menu_throttle_framerate";
       struct config_entry_list *tmp = config_get_entry(conf, tmp_key);
       if (tmp)
          config_unset(conf, tmp->key);
@@ -9856,7 +9823,7 @@ int8_t config_save_overrides(enum override_type type,
    memcpy(input_override_binds, input_config_binds, sizeof(input_config_binds));
 
    /* Load the original config file in memory */
-   config_load_file(global_get_ptr(),
+   config_load_file(
          "without-overrides", settings);
 
    bool_settings       = populate_settings_bool(settings,   &bool_settings_size);
@@ -10095,12 +10062,22 @@ int8_t config_save_overrides(enum override_type type,
             RARCH_DBG("[Override] %s = \"%u\"\n", cfg, overrides->uints.input_mouse_index[i]);
          }
 
+         if (settings->uints.input_keyboard_index[i]
+               != overrides->uints.input_keyboard_index[i])
+         {
+            strlcpy_lit(cfg + _len, "_keyboard_index", sizeof(cfg) - _len);
+            config_set_int(conf, cfg, overrides->uints.input_keyboard_index[i]);
+            RARCH_DBG("[Override] %s = \"%u\"\n", cfg, overrides->uints.input_keyboard_index[i]);
+         }
+
+         /* The live value is what the user configured, not a port a
+          * driver restart handed back. */
          if (settings->uints.input_joypad_index[i]
-               != overrides->uints.input_joypad_index[i])
+               != input_config_get_saved_joypad_index(i))
          {
             strlcpy_lit(cfg + _len, "_joypad_index",  sizeof(cfg) - _len);
-            config_set_int(conf, cfg, overrides->uints.input_joypad_index[i]);
-            RARCH_DBG("[Override] %s = \"%u\"\n", cfg, overrides->uints.input_joypad_index[i]);
+            config_set_int(conf, cfg, input_config_get_saved_joypad_index(i));
+            RARCH_DBG("[Override] %s = \"%u\"\n", cfg, input_config_get_saved_joypad_index(i));
          }
 
          if (settings->uints.input_device_reservation_type[i]
@@ -10427,6 +10404,7 @@ bool input_remapping_load_file(void *data, const char *path)
    CONFIG_GET_INT_BASE(conf, settings, uints.input_turbo_button, "input_turbo_button");
    CONFIG_GET_INT_BASE(conf, settings, uints.input_turbo_period, "input_turbo_period");
    CONFIG_GET_INT_BASE(conf, settings, uints.input_turbo_duty_cycle, "input_turbo_duty_cycle");
+   config_sanitize_turbo_binds(settings);
 
    input_remapping_update_port_map();
 

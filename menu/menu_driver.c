@@ -30,6 +30,7 @@
 #include <streams/file_stream.h>
 #include <time/rtime.h>
 #include <memory/mempool.h>
+#include <retro_atomic.h>
 
 #include "menu_str.h"
 
@@ -2767,6 +2768,14 @@ static void menu_cbs_init(
    menu_cbs_init_bind_start(cbs, path, label, type, idx);
 
    /* It will try to find a corresponding callback function inside
+    * menu_cbs_drag.c, then map this callback to the entry. */
+   menu_cbs_init_bind_drag(cbs, path, label, type, idx);
+
+   /* It will try to find a corresponding callback function inside
+    * menu_cbs_drop.c, then map this callback to the entry. */
+   menu_cbs_init_bind_drop(cbs, path, label, type, idx);
+
+   /* It will try to find a corresponding callback function inside
     * menu_cbs_select.c, then map this callback to the entry. */
    menu_cbs_init_bind_select(cbs, path, label, type, idx);
 
@@ -4336,6 +4345,115 @@ int menu_entry_action(menu_entry_t *entry, size_t i, enum menu_action action)
    return -1;
 }
 
+static struct item_file *menu_entry_drag_drop_item(size_t i,
+      const struct string_list *payload)
+{
+   menu_list_t *menu_list     = menu_driver_state.entries.list;
+   file_list_t *selection_buf = menu_list
+         ? MENU_LIST_GET_SELECTION(menu_list, (unsigned)0) : NULL;
+
+   if (     !selection_buf
+         || i >= selection_buf->size
+         || !payload
+         || !payload->size
+         || !selection_buf->list[i].actiondata)
+      return NULL;
+   return &selection_buf->list[i];
+}
+
+int menu_entry_drag(size_t i, const struct string_list *payload)
+{
+   struct item_file *item    = menu_entry_drag_drop_item(i, payload);
+   menu_file_list_cbs_t *cbs = item
+         ? (menu_file_list_cbs_t*)item->actiondata : NULL;
+
+   if (!cbs || !cbs->action_drag)
+      return -1;
+   return cbs->action_drag(item->path, item->label, item->type,
+         i, item->entry_idx, payload);
+}
+
+int menu_entry_drop(size_t i, const struct string_list *payload)
+{
+   struct item_file *item    = menu_entry_drag_drop_item(i, payload);
+   menu_file_list_cbs_t *cbs = item
+         ? (menu_file_list_cbs_t*)item->actiondata : NULL;
+
+   if (!cbs || !cbs->action_drop)
+      return -1;
+   return cbs->action_drop(item->path, item->label, item->type,
+         i, item->entry_idx, payload);
+}
+
+#ifdef RETRO_ATOMIC_HAS_PTR
+/* Platform drop callbacks may run on the video thread; the menu takes
+ * the payload on the main thread in menu_driver_iterate(). */
+static retro_atomic_ptr_t menu_drop_pending;
+static retro_atomic_int_t menu_drop_accept;
+#endif
+
+bool menu_driver_drop(struct string_list *payload)
+{
+#ifdef RETRO_ATOMIC_HAS_PTR
+   if (     payload
+         && payload->size
+         && retro_atomic_load_acquire_int(&menu_drop_accept))
+   {
+      string_list_free((struct string_list*)
+            retro_atomic_exchange_ptr(&menu_drop_pending, payload));
+      return true;
+   }
+#endif
+   string_list_free(payload);
+   return false;
+}
+
+bool menu_driver_drop_uri_list(char *list)
+{
+   union string_list_elem_attr attr;
+   struct string_list *files = string_list_new();
+   char *line                = list;
+
+   if (!files)
+      return false;
+   attr.i = 0;
+
+   while (line && *line)
+   {
+      char *next = strchr(line, '\n');
+      if (next)
+         *next++ = '\0';
+      line[strcspn(line, "\r")] = '\0';
+
+      if (     *line != '#'
+            && string_starts_with_size(line, "file://",
+                  STRLEN_CONST("file://")))
+      {
+         /* Skip the authority, normally empty or "localhost". */
+         char *path = strchr(line + STRLEN_CONST("file://"), '/');
+         if (     path
+               && string_percent_decode(path, strlen(path) + 1, path) > 0
+               && !string_list_append(files, path, attr))
+         {
+            string_list_free(files);
+            return false;
+         }
+      }
+      line = next;
+   }
+   return menu_driver_drop(files);
+}
+
+static void menu_driver_drop_accept(bool accept)
+{
+#ifdef RETRO_ATOMIC_HAS_PTR
+   retro_atomic_store_release_int(&menu_drop_accept, accept ? 1 : 0);
+   if (!accept)
+      string_list_free((struct string_list*)
+            retro_atomic_exchange_ptr(&menu_drop_pending, NULL));
+#endif
+}
+
 bool menu_entries_append(
       file_list_t *list,
       const char *path,
@@ -4421,6 +4539,8 @@ bool menu_entries_append(
    cbs->action_cancel              = NULL;
    cbs->action_scan                = NULL;
    cbs->action_start               = NULL;
+   cbs->action_drag                = NULL;
+   cbs->action_drop                = NULL;
    cbs->action_info                = NULL;
    cbs->action_left                = NULL;
    cbs->action_right               = NULL;
@@ -4509,6 +4629,8 @@ void menu_entries_prepend(file_list_t *list,
    cbs->action_cancel              = NULL;
    cbs->action_scan                = NULL;
    cbs->action_start               = NULL;
+   cbs->action_drag                = NULL;
+   cbs->action_drop                = NULL;
    cbs->action_info                = NULL;
    cbs->action_left                = NULL;
    cbs->action_right               = NULL;
@@ -4791,8 +4913,12 @@ static bool menu_driver_init_internal(
          menu_st->driver_data               = (menu_handle_t*)
             menu_st->driver_ctx->init(&menu_st->userdata,
                   video_is_threaded);
-         menu_st->driver_data->userdata     = menu_st->userdata;
-         menu_st->driver_data->driver_ctx   = menu_st->driver_ctx;
+         /* init returns NULL on failure; the check below handles it. */
+         if (menu_st->driver_data)
+         {
+            menu_st->driver_data->userdata   = menu_st->userdata;
+            menu_st->driver_data->driver_ctx = menu_st->driver_ctx;
+         }
       }
    }
 
@@ -4863,6 +4989,23 @@ bool menu_driver_init(bool video_is_threaded)
    p_disp->menu_driver_id = MENU_DRIVER_ID_UNKNOWN;
 
    return false;
+}
+
+void menu_driver_context_rebuild(void)
+{
+   struct menu_state *menu_st = &menu_driver_state;
+
+   if (!menu_st->driver_ctx || !menu_st->userdata)
+      return;
+
+   /* context_reset loads every texture into its slot without looking
+    * at what the slot held, so on its own it leaks the set already
+    * loaded. Release that set first, as on a video driver swap. */
+   if (menu_st->driver_ctx->context_destroy)
+      menu_st->driver_ctx->context_destroy(menu_st->userdata);
+   if (menu_st->driver_ctx->context_reset)
+      menu_st->driver_ctx->context_reset(menu_st->userdata,
+            video_driver_is_threaded());
 }
 
 const char *menu_driver_ident(void)
@@ -5498,7 +5641,7 @@ unsigned menu_event(
        * That is what makes the selection jump several places when
        * the menu unblocks mid-hold. Treat the block as ending the
        * hold: the next press starts from the initial delay again. */
-      last_time_us                                 = menu_st->current_time_us;
+      last_time_us                                 = menu_st->input_time_us;
       hold_reset                                   = true;
       hold_initial                                 = true;
       delay_count                                  = 0.0f;
@@ -5644,7 +5787,7 @@ unsigned menu_event(
                                       | BIT256_GET_PTR(p_input, RETRO_DEVICE_ID_JOYPAD_RIGHT);
       /* Reset the navigation auto-repeat state machine, for the
        * same reason as the BLOCK_ALL_INPUT path above */
-      last_time_us                    = menu_st->current_time_us;
+      last_time_us                    = menu_st->input_time_us;
       hold_reset                      = true;
       hold_initial                    = true;
       delay_count                     = 0.0f;
@@ -5668,9 +5811,9 @@ unsigned menu_event(
 
    if (navigation_current)
    {
-      float delta_time              = (float)(menu_st->current_time_us - last_time_us) / 1000;
+      float delta_time              = (float)(menu_st->input_time_us - last_time_us) / 1000;
 
-      last_time_us                  = menu_st->current_time_us;
+      last_time_us                  = menu_st->input_time_us;
       navigation_reset_delay        = true;
 
       /* Store first direction in order to block "diagonals" */
@@ -6515,7 +6658,8 @@ MENU_NOINLINE static int menu_input_post_iterate(
          /* Normal menu input */
          else
          {
-            /* Detect gesture type */
+            /* Detect gesture type. A mouse goes through here as well:
+             * its left click is the tap. */
             if (!(menu_input->pointer.flags & MENU_INP_PTR_FLG_DRAGGED))
             {
                /* Pointer hasn't moved - check press duration */
@@ -6859,6 +7003,11 @@ void menu_driver_toggle(
 
       menu_st->flags               |= MENU_ST_FLAG_ENTRIES_NEED_REFRESH;
 
+      /* The window may have changed monitor, or its monitor mode,
+       * since the menu was last up; Menu Frame Rate's 'Display Rate'
+       * reads it again */
+      video_driver_window_output_changed();
+
       /* Menu should always run with swap interval 1 if vsync is on.
        * current_video can be NULL when the toggle runs while video is
        * torn down or failed to initialize (shutdown paths - see the
@@ -6959,6 +7108,7 @@ void retroarch_menu_running(void)
          menu->driver_ctx->toggle(menu->userdata, true);
 
       menu_st->flags |= MENU_ST_FLAG_ALIVE;
+      menu_driver_drop_accept(true);
       menu_driver_toggle(
             video_st->current_video,
             video_st->data,
@@ -7032,6 +7182,7 @@ void retroarch_menu_running_finished(bool quit)
          menu->driver_ctx->toggle(menu->userdata, false);
 
       menu_st->flags &= ~MENU_ST_FLAG_ALIVE;
+      menu_driver_drop_accept(false);
       /* Ramp the core's first frames back up. Not when quitting - nothing
        * is coming back. Not gated on menu_pause_libretro: the setting can be
        * turned off from inside the menu it paused, and a resume with no
@@ -7224,6 +7375,7 @@ bool menu_driver_ctl(enum rarch_menu_ctl_state state, void *data)
             /* Every list is gone, so every cbs has come back to the
              * pool; the chunks behind them go back to libc here. */
             menu_cbs_pool_deinit();
+            menu_driver_drop_accept(false);
             /* Same point in teardown: every node has been released, so
              * nothing is still sharing a fullpath. */
             menu_str_cache_flush();
@@ -8585,6 +8737,19 @@ bool menu_driver_iterate(
       retro_time_t current_time)
 {
    menu_driver_pump_pending(menu_st, settings);
+
+#ifdef RETRO_ATOMIC_HAS_PTR
+   if (retro_atomic_load_relaxed_ptr(&menu_drop_pending))
+   {
+      struct string_list *files = (struct string_list*)
+            retro_atomic_exchange_ptr(&menu_drop_pending, NULL);
+      if (files)
+      {
+         menu_entry_drop(menu_st->selection_ptr, files);
+         string_list_free(files);
+      }
+   }
+#endif
 
    return ( menu_st->driver_data
          && generic_menu_iterate(

@@ -241,6 +241,11 @@ typedef struct
    ctr_scale_vector_t scale_vector_bottom;
    const font_renderer_driver_t* font_driver;
    void* font_data;
+   /* Texture memory the atlas outgrew: a frame in flight may still
+    * draw from it, so it goes when the font does - the atlas grows at
+    * most twice */
+   void* retired[2];
+   unsigned retired_count;
 } ctr_font_t;
 
 /* An annoyance...
@@ -376,15 +381,67 @@ static void gfx_display_ctr_draw(gfx_display_ctx_draw_t *draw,
  * FONT DRIVER
  */
 
+/* Swizzles the atlas's rectangle into the font texture, in place in
+ * the linear memory the GPU samples, and flushes it out of the cache */
+static void ctr_font_upload(ctr_font_t *font,
+      const struct font_atlas *atlas,
+      unsigned x0, unsigned y0, unsigned x1, unsigned y1)
+{
+   unsigned i, j;
+   uint8_t       *tex = (uint8_t*)font->texture.data;
+   const uint8_t *src = atlas->buffer;
+
+   if (x1 > atlas->width)
+      x1 = atlas->width;
+   if (y1 > atlas->height)
+      y1 = atlas->height;
+   if (x1 > font->texture.width)
+      x1 = font->texture.width;
+   if (y1 > font->texture.height)
+      y1 = font->texture.height;
+   for (j = y0; j < y1; j++)
+      for (i = x0; i < x1; i++)
+         tex[ctrgu_swizzle_coords(i, j, font->texture.width)] =
+            src[i + j * atlas->width];
+
+   GSPGPU_FlushDataCache(tex, font->texture.width * font->texture.height);
+}
+
+/* Texture memory holding all of @atlas, sized up to powers of two,
+ * with the scale vectors set for it; NULL if none can be had */
+static void *ctr_font_make_texture(ctr_font_t *font,
+      const struct font_atlas *atlas)
+{
+   unsigned width  = next_pow2(atlas->width);
+   unsigned height = next_pow2(atlas->height);
+   void    *data   = linearAlloc(width * height);
+
+   if (!data)
+      return NULL;
+   memset(data, 0, width * height);
+
+   font->texture.width  = width;
+   font->texture.height = height;
+   font->texture.data   = data;
+   ctr_font_upload(font, atlas, 0, 0, atlas->width, atlas->height);
+
+   CTR_SET_SCALE_VECTOR(
+         &font->scale_vector_top,
+         CTR_TOP_FRAMEBUFFER_WIDTH,
+         CTR_TOP_FRAMEBUFFER_HEIGHT,
+         width, height);
+   CTR_SET_SCALE_VECTOR(
+         &font->scale_vector_bottom,
+         CTR_BOTTOM_FRAMEBUFFER_WIDTH,
+         CTR_BOTTOM_FRAMEBUFFER_HEIGHT,
+         width, height);
+   return data;
+}
+
 static void* ctr_font_init(void* data, const char* font_path,
       float font_size, bool is_threaded)
 {
-   unsigned int i, j;
-   ctr_scale_vector_t *vec_top    = NULL;
-   ctr_scale_vector_t *vec_bottom = NULL;
-   const uint8_t*     src         = NULL;
-   uint8_t* tmp                   = NULL;
-   const struct font_atlas* atlas = NULL;
+   struct font_atlas* atlas       = NULL;
    ctr_font_t* font               = (ctr_font_t*)calloc(1, sizeof(*font));
    ctr_video_t* ctr               = (ctr_video_t*)data;
 
@@ -401,48 +458,16 @@ static void* ctr_font_init(void* data, const char* font_path,
    }
 
    atlas                = font->font_driver->get_atlas(font->font_data);
+   /* The atlas may grow, to the 3DS GPU's largest texture */
+   atlas->max_width     = 1024;
+   atlas->max_height    = 1024;
 
-   font->texture.width  = next_pow2(atlas->width);
-   font->texture.height = next_pow2(atlas->height);
-#if FONT_TEXTURE_IN_VRAM
-   font->texture.data   = vramAlloc(font->texture.width * font->texture.height);
-   tmp                  = linearAlloc(font->texture.width * font->texture.height);
-#else
-   font->texture.data   = linearAlloc(font->texture.width * font->texture.height);
-   tmp                  = font->texture.data;
-#endif
-
-   src                  = atlas->buffer;
-
-   for (j = 0; (j < atlas->height) && (j < font->texture.height); j++)
-      for (i = 0; (i < atlas->width) && (i < font->texture.width); i++)
-         tmp[ctrgu_swizzle_coords(i, j, font->texture.width)] = src[i + j * atlas->width];
-
-   GSPGPU_FlushDataCache(tmp, font->texture.width * font->texture.height);
-
-#if FONT_TEXTURE_IN_VRAM
-   ctrGuCopyImage(true, tmp, font->texture.width >> 2, font->texture.height, CTRGU_RGBA8, true,
-                  font->texture.data, font->texture.width >> 2, CTRGU_RGBA8,  true);
-
-   linearFree(tmp);
-#endif
-
-   vec_top    = &font->scale_vector_top;
-   vec_bottom = &font->scale_vector_bottom;
-
-   CTR_SET_SCALE_VECTOR(
-         vec_top,
-         CTR_TOP_FRAMEBUFFER_WIDTH,
-         CTR_TOP_FRAMEBUFFER_HEIGHT,
-         font->texture.width,
-         font->texture.height);
-
-   CTR_SET_SCALE_VECTOR(
-         vec_bottom,
-         CTR_BOTTOM_FRAMEBUFFER_WIDTH,
-         CTR_BOTTOM_FRAMEBUFFER_HEIGHT,
-         font->texture.width,
-         font->texture.height);
+   if (!(font->texture.data = ctr_font_make_texture(font, atlas)))
+   {
+      font->font_driver->free(font->font_data);
+      free(font);
+      return NULL;
+   }
 
    return font;
 }
@@ -457,146 +482,30 @@ static void ctr_font_free(void* data, bool is_threaded)
    if (font->font_driver && font->font_data)
       font->font_driver->free(font->font_data);
 
-#ifdef FONT_TEXTURE_IN_VRAM
-   vramFree(font->texture.data);
-#else
    linearFree(font->texture.data);
-#endif
+   {
+      unsigned i;
+      for (i = 0; i < font->retired_count; i++)
+         linearFree(font->retired[i]);
+   }
    free(font);
 }
 
-static int ctr_font_get_message_width(void* data, const char* msg,
+static int ctr_font_get_message_width(void *data, const char *msg,
       size_t msg_len, float scale)
 {
-   size_t i;
-   int delta_x = 0;
-   const struct font_glyph* glyph_q = NULL;
-   ctr_font_t* font                 = (ctr_font_t*)data;
-   const struct font_glyph* (*get_glyph)(void*, uint32_t)
-                                    = font->font_driver->get_glyph;
-   void *font_data                  = font->font_data;
-
+   ctr_font_t *font = (ctr_font_t*)data;
    if (!font)
       return 0;
-
-   glyph_q = get_glyph(font_data, '?');
-
-   for (i = 0; i < msg_len; i++)
-   {
-      const struct font_glyph* glyph;
-      const char* msg_tmp            = &msg[i];
-      unsigned code                  = utf8_walk(&msg_tmp);
-      unsigned skip                  = msg_tmp - &msg[i];
-
-      if (skip > 1)
-         i += skip - 1;
-
-
-      /* Do something smarter here ... */
-      if (!(glyph = get_glyph(font_data, code)))
-         if (!(glyph = glyph_q))
-            continue;
-
-      delta_x += glyph->advance_x;
-   }
-
-   return delta_x * scale;
+   return font_renderer_get_message_width(font->font_driver,
+         font->font_data, msg, msg_len, scale);
 }
 
-static void ctr_font_render_line(
-      ctr_video_t *ctr,
-      ctr_font_t* font,
-      const struct font_glyph* glyph_q,
-      const char* msg,
-      size_t msg_len,
-      float scale,
-      const unsigned int color,
-      float pos_x,
-      float pos_y,
-      unsigned width,
-      unsigned height,
-      unsigned text_align)
+/* Draws the glyph vertices from vertex_cache.current up to @v, one
+ * line's worth, and moves the cache past them. */
+static void ctr_font_draw_line(ctr_video_t *ctr, ctr_font_t *font,
+      ctr_vertex_t *v, const unsigned int color)
 {
-   unsigned int i;
-   const char* msg_end = msg + msg_len;
-   ctr_vertex_t* v     = NULL;
-   int delta_x         = 0;
-   int delta_y         = 0;
-   int x               = roundf(pos_x * width);
-   int y               = roundf((1.0f - pos_y) * height);
-   const struct font_glyph* (*get_glyph)(void*, uint32_t)
-                       = font->font_driver->get_glyph;
-   void *font_data     = font->font_data;
-
-   /* For right/center alignment, compute width with a lightweight pass
-    * that only accumulates advance_x — avoids the redundant glyph lookups
-    * and atlas dirty checks that ctr_font_get_message_width would repeat. */
-   if (text_align == TEXT_ALIGN_RIGHT || text_align == TEXT_ALIGN_CENTER)
-   {
-      int width_accum      = 0;
-      const char *scan     = msg;
-      const char *scan_end = msg_end;
-      while (scan < scan_end)
-      {
-         const struct font_glyph *glyph;
-         uint32_t code       = utf8_walk(&scan);
-         if (!(glyph = get_glyph(font_data, code)))
-            if (!(glyph = glyph_q))
-               continue;
-         width_accum += glyph->advance_x;
-      }
-
-      if (text_align == TEXT_ALIGN_RIGHT)
-         x -= (int)(width_accum * scale);
-      else
-         x -= (int)(width_accum * scale) / 2;
-   }
-
-   if ((ctr->vertex_cache.size - (ctr->vertex_cache.current - ctr->vertex_cache.buffer)) < msg_len)
-      ctr->vertex_cache.current = ctr->vertex_cache.buffer;
-
-   v       = ctr->vertex_cache.current;
-
-   for (i = 0; i < msg_len; i++)
-   {
-      const struct font_glyph* glyph;
-      int off_x, off_y, tex_x, tex_y, width, height;
-      const char* msg_tmp            = &msg[i];
-      unsigned code                  = utf8_walk(&msg_tmp);
-      unsigned skip                  = msg_tmp - &msg[i];
-
-      if (skip > 1)
-         i += skip - 1;
-
-      /* Do something smarter here ... */
-      if (!(glyph = get_glyph(font_data, code)))
-         if (!(glyph = glyph_q))
-            continue;
-
-      off_x    = glyph->draw_offset_x;
-      off_y    = glyph->draw_offset_y;
-      tex_x    = glyph->atlas_offset_x;
-      tex_y    = glyph->atlas_offset_y;
-      width    = glyph->width;
-      height   = glyph->height;
-
-      v->x0    = x + (off_x + delta_x) * scale;
-      v->y0    = y + (off_y + delta_y) * scale;
-      v->u0    = tex_x;
-      v->v0    = tex_y;
-      v->x1    = v->x0 + width * scale;
-      v->y1    = v->y0 + height * scale;
-      v->u1    = v->u0 + width;
-      v->v1    = v->v0 + height;
-
-      v++;
-      delta_x += glyph->advance_x;
-      delta_y += glyph->advance_y;
-   }
-
-   if (v == ctr->vertex_cache.current)
-      return;
-
    GPUCMD_AddWrite(GPUREG_GSH_BOOLUNIFORM, 0);
    if (!ctr->render_font_bottom)
       ctrGuSetVertexShaderFloatUniform(0, (float*)&font->scale_vector_top, 1);
@@ -660,33 +569,67 @@ static void ctr_font_render_line(
 
 static void ctr_font_render_message(
       ctr_video_t *ctr,
-      ctr_font_t* font, const char* msg, float scale,
+      ctr_font_t* font, const char* msg, size_t msg_len, float scale,
       const unsigned int color, float pos_x, float pos_y,
       unsigned width, unsigned height, unsigned text_align)
 {
    float line_height;
    struct font_line_metrics *line_metrics = NULL;
+   ctr_vertex_t* v                        = NULL;
+   int x                                  = 0;
+   int y                                  = 0;
    const struct font_glyph* (*get_glyph)(void*, uint32_t)
                                           = font->font_driver->get_glyph;
    void *font_data                        = font->font_data;
    const struct font_glyph* glyph_q       = get_glyph(font_data, '?');
-   int lines                              = 0;
+   bool aligned                           = (text_align == TEXT_ALIGN_RIGHT
+                                         || text_align == TEXT_ALIGN_CENTER);
+
    font->font_driver->get_line_metrics(font_data, &line_metrics);
    line_height = (float)line_metrics->height * scale / (float)height;
-   for (;;)
-   {
-      const char *end = msg;
-      while (*end && *end != '\n')
-         end++;
 
-      ctr_font_render_line(ctr, font, glyph_q, msg, (size_t)(end - msg),
-            scale, color, pos_x, pos_y - (float)lines * line_height,
-            width, height, text_align);
-      if (!*end)
-         break;
-      msg = end + 1;
-      lines++;
-   }
+#define FONT_LAYOUT_ALIGNED aligned
+#define FONT_LAYOUT_LINE(line, line_width, count, bytes) \
+   do \
+   { \
+      (void)(count); \
+      x = roundf(pos_x * width); \
+      y = roundf((1.0f - (pos_y - (float)(line) * line_height)) * height); \
+      if (text_align == TEXT_ALIGN_RIGHT) \
+         x -= (int)((line_width) * scale); \
+      else if (text_align == TEXT_ALIGN_CENTER) \
+         x -= (int)((line_width) * scale) / 2; \
+      if ((ctr->vertex_cache.size - (ctr->vertex_cache.current \
+                  - ctr->vertex_cache.buffer)) < (bytes)) \
+         ctr->vertex_cache.current = ctr->vertex_cache.buffer; \
+      v = ctr->vertex_cache.current; \
+   } while (0)
+#define FONT_LAYOUT_GLYPH(glyph, pen_x, pen_y) \
+   do \
+   { \
+      int off_x  = (glyph)->draw_offset_x; \
+      int off_y  = (glyph)->draw_offset_y; \
+      int tex_x  = (glyph)->atlas_offset_x; \
+      int tex_y  = (glyph)->atlas_offset_y; \
+      int g_w    = (glyph)->width; \
+      int g_h    = (glyph)->height; \
+      v->x0      = x + (off_x + (pen_x)) * scale; \
+      v->y0      = y + (off_y + (pen_y)) * scale; \
+      v->u0      = tex_x; \
+      v->v0      = tex_y; \
+      v->x1      = v->x0 + g_w * scale; \
+      v->y1      = v->y0 + g_h * scale; \
+      v->u1      = v->u0 + g_w; \
+      v->v1      = v->v0 + g_h; \
+      v++; \
+   } while (0)
+#define FONT_LAYOUT_LINE_END() \
+   do \
+   { \
+      if (v != ctr->vertex_cache.current) \
+         ctr_font_draw_line(ctr, font, v, color); \
+   } while (0)
+#include "../font_layout.h"
 }
 
 static void ctr_font_render_msg(
@@ -694,6 +637,7 @@ static void ctr_font_render_msg(
       void* data, const char* msg, size_t msg_len,
       const struct font_params *params)
 {
+   font_params_resolved_t rp;
    int drop_x, drop_y;
    unsigned color, r, g, b, alpha;
    enum text_alignment text_align;
@@ -708,48 +652,55 @@ static void ctr_font_render_msg(
    if (!font || !msg || !*msg)
       return;
 
-   if (params)
+   /* Asked for before anything is laid out. Glyphs rasterized since
+    * the last message go up into the texture - before, only those
+    * there at init ever reached it - and an atlas that has grown gets
+    * texture memory of its size */
+   if (font->font_driver && font->font_data)
    {
-      x                       = params->x;
-      y                       = params->y;
-      scale                   = params->scale;
-      text_align              = params->text_align;
-      drop_x                  = params->drop_x;
-      drop_y                  = params->drop_y;
-      drop_mod                = params->drop_mod;
-      drop_alpha              = params->drop_alpha;
-
-      r                       = FONT_COLOR_GET_RED(params->color);
-      g                       = FONT_COLOR_GET_GREEN(params->color);
-      b                       = FONT_COLOR_GET_BLUE(params->color);
-      alpha                   = FONT_COLOR_GET_ALPHA(params->color);
-
-      color                   = COLOR_ABGR(r, g, b, alpha);
+      struct font_atlas *atlas = font->font_driver->get_atlas(font->font_data);
+      if (     font->retired_count < 2
+            && (   next_pow2(atlas->width)  != font->texture.width
+                || next_pow2(atlas->height) != font->texture.height))
+      {
+         void *old_data = font->texture.data;
+         if (ctr_font_make_texture(font, atlas))
+         {
+            font->retired[font->retired_count++] = old_data;
+            atlas->dirty = false;
+         }
+      }
+      if (atlas->dirty)
+      {
+         ctr_font_upload(font, atlas, atlas->dirty_x0, atlas->dirty_y0,
+               atlas->dirty_x1, atlas->dirty_y1);
+         atlas->dirty = false;
+      }
    }
-   else
+
+   font_driver_resolve_params(params, &rp);
+   x          = rp.x;
+   y          = rp.y;
+   scale      = rp.scale;
+   text_align = rp.text_align;
+   drop_x     = rp.drop_x;
+   drop_y     = rp.drop_y;
+   drop_mod   = rp.drop_mod;
+   drop_alpha = rp.drop_alpha;
+   r          = rp.rgba[0];
+   g          = rp.rgba[1];
+   b          = rp.rgba[2];
+   alpha           = rp.rgba[3];
+   color      = COLOR_ABGR(r, g, b, alpha);
+   /* This driver's own shadow for the on-screen message */
+   if (!params)
    {
-      settings_t *settings    = config_get_ptr();
-      float video_msg_pos_x   = settings->floats.video_msg_pos_x;
-      float video_msg_pos_y   = settings->floats.video_msg_pos_y;
-      float video_msg_color_r = settings->floats.video_msg_color_r;
-      float video_msg_color_g = settings->floats.video_msg_color_g;
-      float video_msg_color_b = settings->floats.video_msg_color_b;
-      x                       = video_msg_pos_x;
-      y                       = video_msg_pos_y;
-      scale                   = 1.0f;
-      text_align              = TEXT_ALIGN_LEFT;
-
-      r                       = (video_msg_color_r * 255);
-      g                       = (video_msg_color_g * 255);
-      b                       = (video_msg_color_b * 255);
-      alpha                   = 255;
-      color                   = COLOR_ABGR(r, g, b, alpha);
-
-      drop_x                  = 1;
-      drop_y                  = -1;
-      drop_mod                = 0.0f;
-      drop_alpha              = 0.75f;
+      drop_x     = 1;
+      drop_y     = -1;
+      drop_mod   = 0.0f;
+      drop_alpha = 0.75f;
    }
+
 
    if (drop_x || drop_y)
    {
@@ -759,13 +710,13 @@ static void ctr_font_render_msg(
       unsigned alpha_dark     = alpha * drop_alpha;
       unsigned color_dark     = COLOR_ABGR(r_dark, g_dark,
             b_dark, alpha_dark);
-      ctr_font_render_message(ctr, font, msg, scale, color_dark,
+      ctr_font_render_message(ctr, font, msg, msg_len, scale, color_dark,
                               x + scale * drop_x / width, y +
                               scale * drop_y / height,
                               width, height, text_align);
    }
 
-   ctr_font_render_message(ctr, font, msg, scale,
+   ctr_font_render_message(ctr, font, msg, msg_len, scale,
                            color, x, y,
                            width, height, text_align);
 }

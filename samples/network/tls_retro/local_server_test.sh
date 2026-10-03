@@ -37,6 +37,16 @@ mkleafx clientonly 'extendedKeyUsage=clientAuth\n'
 mkleafx codesign 'extendedKeyUsage=codeSigning\n'
 mkleafx serverauth 'extendedKeyUsage=serverAuth,clientAuth\nkeyUsage=digitalSignature,keyEncipherment\n'
 mkleafx nosign 'keyUsage=keyEncipherment,dataEncipherment\n'
+# IP addresses: matched against iPAddress SAN entries only. One leaf
+# carries IP:127.0.0.1, the other the same address as a DNS name, which
+# must not vouch for the address.
+mkleafip() { # name san
+   openssl req -newkey rsa:2048 -nodes -keyout $D/$1.key -out $D/$1.csr -subj "/CN=127.0.0.1" 2>/dev/null
+   printf 'subjectAltName=%s\nbasicConstraints=CA:FALSE\n' "$2" > $D/$1.ext
+   openssl x509 -req -in $D/$1.csr -CA $D/ca.pem -CAkey $D/ca.key -CAcreateserial -out $D/$1.pem -days 2 -extfile $D/$1.ext 2>/dev/null
+}
+mkleafip ipsan "IP:127.0.0.1"
+mkleafip ipdns "DNS:127.0.0.1"
 # a real-world shape: root -> intermediate CA -> leaf, the server sending
 # leaf + intermediate and the client trusting only the root; one with an
 # RSA intermediate, one with a P-384 intermediate under the RSA root
@@ -83,6 +93,8 @@ run "policy: clientAuth-only EKU is refused"              clientonly ECDHE-RSA-A
 run "policy: codeSigning-only EKU is refused"             codesign   ECDHE-RSA-AES128-GCM-SHA256 prime256v1 1 localhost 0 $D/ca.pem
 run "policy: serverAuth EKU with digitalSignature is fine" serverauth ECDHE-RSA-AES128-GCM-SHA256 prime256v1 0 localhost 0 $D/ca.pem
 run "policy: keyUsage without digitalSignature is refused" nosign    ECDHE-RSA-AES128-GCM-SHA256 prime256v1 1 localhost 0 $D/ca.pem
+run "IP address matches an iPAddress entry"            ipsan ECDHE-RSA-AES128-GCM-SHA256 prime256v1 0 127.0.0.1 0 $D/ca.pem
+run "IP address written as a DNS name is refused"      ipdns ECDHE-RSA-AES128-GCM-SHA256 prime256v1 1 127.0.0.1 0 $D/ca.pem
 run "chain: root -> RSA intermediate -> leaf"      viarsa  ECDHE-RSA-AES128-GCM-SHA256 prime256v1 0 localhost 0 $D/ca.pem
 run "chain: root -> P-384 intermediate -> leaf"    viap384 ECDHE-RSA-AES128-GCM-SHA256 prime256v1 0 localhost 0 $D/ca.pem
 run "chain: trusting the intermediate directly also works" viarsa ECDHE-RSA-AES128-GCM-SHA256 prime256v1 0 localhost 0 $D/irsa.pem
@@ -138,11 +150,46 @@ else
    echo "FAIL: KeyUpdate: $(cat $D/ku.client) / server saw: $(grep '^ack' $D/ku.out | tr '\n' ' ')"; exit 1
 fi
 # concurrent first use: six threads verify against a store none of them
-# has built yet; under TSan when the tools are built with it
+# has built yet, and with an ECDSA server compute the curve constants
+# none of them has computed yet; under TSan when the tools are built
+# with it
 make -s tls_threads
-openssl s_server -accept 44331 -cert $D/rsa.pem -key $D/rsa.key -www >/dev/null 2>&1 &
-SRV=$!; sleep 0.4
-set +e; $RUN ./tls_threads$EXE localhost 44331 $D/ca.pem > $D/thr.out 2>&1; rc=$?; set -e
-kill $SRV 2>/dev/null; wait $SRV 2>/dev/null || true
-if [ $rc -eq 0 ]; then echo "ok:   concurrent first-use verification from six threads"; else echo "FAIL: threads: $(cat $D/thr.out)"; exit 1; fi
+for key in rsa p256; do
+   openssl s_server -accept 44331 -cert $D/$key.pem -key $D/$key.key -www >/dev/null 2>&1 &
+   SRV=$!; sleep 0.4
+   set +e; $RUN ./tls_threads$EXE localhost 44331 $D/ca.pem > $D/thr.out 2>&1; rc=$?; set -e
+   kill $SRV 2>/dev/null; wait $SRV 2>/dev/null || true
+   if [ $rc -eq 0 ]; then echo "ok:   concurrent first-use verification from six threads ($key)"; else echo "FAIL: threads ($key): $(cat $D/thr.out)"; exit 1; fi
+done
+# Without AES instructions the client offers ChaCha20-Poly1305 first,
+# which s_server, taking the client's order, then picks on both versions
+make -s tls_fetch_noaes
+noaes() { # label version-option expected-suite
+   openssl s_server -accept 44331 -cert $D/rsa.pem -key $D/rsa.key $2 -www >/dev/null 2>&1 &
+   SRV=$!; sleep 0.4
+   set +e; TLS_FETCH_SUITE=1 $RUN ./tls_fetch_noaes$EXE localhost 44331 0 $D/ca.pem > $D/noaes.out 2>&1; rc=$?; set -e
+   kill $SRV 2>/dev/null; wait $SRV 2>/dev/null || true
+   if [ $rc -eq 0 ] && grep -q "^suite $3" $D/noaes.out; then echo "ok:   $1"
+   else echo "FAIL: $1 (rc=$rc): $(cat $D/noaes.out)"; exit 1; fi
+}
+noaes "no AES instructions: TLS 1.3 negotiates ChaCha20-Poly1305" -tls1_3 1303
+noaes "no AES instructions: TLS 1.2 negotiates ChaCha20-Poly1305" -tls1_2 cca8
+# RetroArch's HTTP client over the built-in TLS: net_http fetches a file
+# of 3 MiB and change, whose records straddle its read windows at odd
+# offsets, on both versions and both AEADs; the body must hash right.
+make -s tls_http
+mkdir -p $D/www
+head -c 3158073 /dev/urandom > $D/www/body.bin
+SUM=$(openssl dgst -sha256 -r $D/www/body.bin | cut -d' ' -f1)
+http() { # label version cipher-option cipher
+   (cd $D/www && exec openssl s_server -accept 44331 -cert $D/rsa.pem -key $D/rsa.key $2 $3 "$4" -WWW) >/dev/null 2>&1 &
+   SRV=$!; sleep 0.4
+   set +e; $RUN ./tls_http$EXE 44331 body.bin $SUM $D/ca.pem > $D/http.out 2>&1; rc=$?; set -e
+   kill $SRV 2>/dev/null; wait $SRV 2>/dev/null || true
+   if [ $rc -eq 0 ]; then echo "ok:   $1"; else echo "FAIL: $1: $(cat $D/http.out)"; exit 1; fi
+}
+http "net_http over TLS 1.2, AES-128-GCM"        -tls1_2 -cipher       ECDHE-RSA-AES128-GCM-SHA256
+http "net_http over TLS 1.2, ChaCha20-Poly1305"  -tls1_2 -cipher       ECDHE-RSA-CHACHA20-POLY1305
+http "net_http over TLS 1.3, AES-128-GCM"        -tls1_3 -ciphersuites TLS_AES_128_GCM_SHA256
+http "net_http over TLS 1.3, ChaCha20-Poly1305"  -tls1_3 -ciphersuites TLS_CHACHA20_POLY1305_SHA256
 echo "[pass] tls_retro local server matrix"

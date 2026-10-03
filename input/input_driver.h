@@ -286,6 +286,7 @@ struct bsv_movie
    uint32s_index_t *superblocks;
    uint32s_index_t *blocks;
    uint32_t *superblock_seq;
+   size_t superblock_seq_len;
    uint8_t commit_interval, commit_threshold;
 #endif
 
@@ -366,7 +367,24 @@ struct remote_message
 typedef struct
 {
    char display_name[NAME_MAX_LENGTH];
+   /* For the menu's Input Information, where the driver says: which
+    * device on the desk this mouse is part of ("" if not known), its
+    * USB ids (both 0 if not known), and whether it is one to leave
+    * out - an index with no mouse behind it. */
+   char device[64];
+   uint16_t vid;
+   uint16_t pid;
+   bool hidden;
 } input_mouse_info_t;
+
+/* A keyboard the input driver can tell from the others: its name, for
+ * the menu. In the order the driver lists them. */
+typedef struct
+{
+   char display_name[NAME_MAX_LENGTH];
+   uint16_t vid; /* 0 with pid 0: not known */
+   uint16_t pid;
+} input_keyboard_info_t;
 
 typedef struct
 {
@@ -547,6 +565,23 @@ struct input_driver
     * set to NULL if haptic feedback / vibration is not supported.
     */
    void (*keypress_vibrate)(void);
+
+   /**
+    * Whether the driver, as it is running now, can be left running while
+    * the video driver is restarted: nothing it holds belongs to the video
+    * driver, its window or its thread, and it needs no restart to notice
+    * anything a restart used to make it notice. The joypad driver in use
+    * is its to answer for as well, since the two are kept or restarted
+    * together. NULL, the last member and so what every driver that does
+    * not name it has, means no: the driver is freed with the video driver
+    * and started again, as it always was. See
+    * input_driver_keep_for_video_restart().
+    *
+    * @param data  The input state struct
+    *
+    * @return True if the driver can stay.
+    */
+   bool (*survives_video)(void *data);
 };
 
 struct rarch_joypad_driver
@@ -603,6 +638,24 @@ typedef struct
    const input_device_driver_t   *primary_joypad;        /* ptr alignment */
    const input_device_driver_t   *secondary_joypad;      /* ptr alignment */
    const retro_keybind_set *libretro_input_binds[MAX_USERS];
+   /* When the devices were last read, on cpu_features_get_time_usec()'s
+    * clock; 0 while nothing asks for it. See input_driver_poll(). */
+   retro_time_t poll_time_us;
+   /* The input driver left running across a video driver restart, from
+    * the video driver's teardown until its start-up hands it back.
+    * input_driver_keep_for_video_restart(). */
+   input_driver_t *kept_driver;
+   void *kept_data;
+   /* The joypad driver setting the joypad driver was started with. */
+   char joypad_setting_at_init[32];
+   /* The settings that decide which port a controller gets, as they
+    * were then (input_driver_detect_settings()). */
+   uint32_t detect_settings_at_init;
+   /* Something has thrown away what the drivers' start gives - the
+    * controllers' configuration - so the next restart is a restart of
+    * the input driver too, whatever it says.
+    * input_driver_restart_with_next_video_restart(). */
+   bool kept_not_next;
 #ifdef HAVE_COMMAND
    /* Bumped whenever the command interfaces below are torn down. A
     * command that reinitialises the input driver - LOAD_CONTENT,
@@ -654,6 +707,7 @@ typedef struct
    input_remap_cache_t remapping_cache;
    input_device_info_t input_device_info[MAX_INPUT_DEVICES]; /* unsigned alignment */
    input_mouse_info_t input_mouse_info[MAX_INPUT_DEVICES];
+   input_keyboard_info_t input_keyboard_info[MAX_INPUT_DEVICES];
    input_sensor_map_t input_sensor_map[MAX_INPUT_DEVICES];
 
    /**
@@ -696,7 +750,28 @@ typedef struct
     * armed outside input_keys_pressed() starts from the previous
     * frame's held set. */
    uint16_t wait_release_mask[MAX_USERS];
-   bool    joypad_state_cache_valid[MAX_USERS];
+
+   /* The frame's view of each port's RetroPad buttons, as a core is
+    * given them: after port mapping, remaps, turbo, hold, overlays and
+    * analog-to-d-pad.  Compiled when a core asks for the port's mask,
+    * or for a second button in the frame; from then on every button
+    * and mask query for the port reads this word.  Invalidated by
+    * input_driver_poll(), and when the core's first analog request
+    * changes analog-to-d-pad for the port. */
+   int16_t frame_view_joypad[MAX_USERS];
+
+   /* What input_driver_poll() invalidates, a bit per port in each
+    * word, kept together so that invalidating all of it is one store:
+    *   joypad_cache - joypad_state_cache[port] holds this frame's mask
+    *   view         - frame_view_joypad[port] has been compiled
+    *   asked        - the port's first button of the frame was read */
+   struct
+   {
+      uint16_t joypad_cache;
+      uint16_t view;
+      uint16_t asked;
+      uint16_t snapshot[2]; /* pads snapshotted: primary, secondary driver */
+   } frame_valid;
 
    retro_bits_512_t keyboard_mapping_bits;    /* bool alignment */
    input_game_focus_state_t game_focus_state; /* bool alignment */
@@ -836,6 +911,61 @@ float input_driver_get_sensor(
 
 uint64_t input_driver_get_capabilities(void);
 
+/* Which input driver a window gets: input_driver_choice.c. */
+#if defined(_WIN32) || defined(_XBOX) || defined(__WINRT__)
+void input_driver_init_windows(const char *joypad_name,
+      input_driver_t **input, void **input_data);
+#endif
+#ifdef HAVE_X11
+void input_driver_init_x11(const char *joypad_name,
+      input_driver_t **input, void **input_data);
+#endif
+void input_driver_init_kms(const char *joypad_name,
+      input_driver_t **input, void **input_data);
+
+/* Leaving the input driver running across a video driver restart: see
+ * input_driver.c. */
+void input_driver_keep_for_video_restart(bool restart, const void *video_data);
+bool input_driver_take_kept(input_driver_t **input, void **input_data);
+void input_driver_drop_kept(void);
+void input_driver_restart_with_next_video_restart(void);
+
+/* For the video driver: see input_driver.c. */
+retro_time_t input_driver_get_poll_time(void);
+uint32_t input_driver_get_flags(void);
+input_driver_t *input_driver_get_current(void);
+input_driver_t **input_driver_video_slots(void ***data_slot);
+void input_driver_free_with_video(const void *video_data);
+bool input_driver_grab_mouse_for_video(void);
+
+/* What kind of window a video driver put up, for the input driver that
+ * goes with it. */
+enum input_window_kind
+{
+   INPUT_WINDOW_OTHER = 0,
+   /* a Windows window (or UWP, or Xbox): input_driver_init_windows() */
+   INPUT_WINDOW_WINDOWS,
+   /* an X11 window: input_driver_init_x11() */
+   INPUT_WINDOW_X11,
+   /* no window system - KMS/DRM, a Vulkan display:
+    * input_driver_init_kms() */
+   INPUT_WINDOW_KMS
+};
+
+/* For a video driver's or a context's start-up, in place of starting
+ * an input driver itself: it brings none, and the frontend is to
+ * start the one that goes with a window of this kind. Clears the two
+ * slots. A driver that says nothing here and fills in no slots gets
+ * the input driver the setting names, as ever. */
+void input_driver_left_to_frontend(enum input_window_kind window,
+      input_driver_t **input, void **input_data);
+
+/* Called once the video driver is up. If it brought an input driver of
+ * its own, that is the input driver. Otherwise one is started here:
+ * the one kept from before the restart; the one that goes with the
+ * kind of window the video driver named
+ * (input_driver_left_to_frontend()); failing those, the one the
+ * setting names. */
 bool video_driver_init_input(
       input_driver_t *tmp,
       settings_t *settings,
@@ -891,6 +1021,11 @@ void input_pad_connect(unsigned port, input_device_driver_t *driver);
 void input_keyboard_event(bool down, unsigned code, uint32_t character,
       uint16_t mod, unsigned device);
 
+/* Keyboard events reported from another thread wait for the poll in a
+ * queue (see input_keyboard_event() in input_driver.c); this is how
+ * many were dropped because it was full. */
+unsigned input_driver_key_events_dropped(void);
+
 input_driver_state_t *input_state_get_ptr(void);
 
 /*************************************/
@@ -942,6 +1077,46 @@ void input_config_set_device_name(unsigned port, const char *name);
  */
 void input_config_set_device_display_name(unsigned port, const char *name);
 void input_config_set_mouse_display_name(unsigned port, const char *name);
+
+/* The mice, for the menu (Information > Input Information). A mouse is
+ * numbered by its Mouse Index, which is the input driver's own index
+ * and is not changed by any of this. A driver that knows more says it
+ * here: @device is what tells one device on the desk from another,
+ * the same for every part of it ("" if not known) - one mouse is
+ * often two or three of the system's mice, and they are listed on
+ * one line; @hidden is an index nothing on the desk is behind.
+ * Cleared, names included, whenever an input driver starts. Main
+ * thread. */
+void input_config_clear_mouse_info(void);
+void input_config_set_mouse_device(unsigned idx, const char *device,
+      uint16_t vid, uint16_t pid, bool hidden);
+const char *input_config_get_mouse_device(unsigned idx);
+/* Whether Mouse Index offers this index. Where the input driver
+ * lists its mice, the ones on the desk are offered - not an index
+ * with no mouse, and not one the driver says to leave out (a keyboard
+ * that can send pointer events, a mouse a program made). Under a
+ * driver that names no mice every index is offered, as it always
+ * was. */
+bool input_config_mouse_offered(unsigned idx);
+uint16_t input_config_get_mouse_vid(unsigned idx);
+uint16_t input_config_get_mouse_pid(unsigned idx);
+bool input_config_get_mouse_hidden(unsigned idx);
+
+/* The keyboards the input driver can tell apart, for the menu
+ * (Information > Input Information). A driver that lists its
+ * keyboards clears the names and sets one for each, in its own order,
+ * when it starts and whenever its list changes; a name that would be
+ * empty is stored as "N/A". Under a driver that cannot tell keyboards
+ * apart there are none. Main thread. */
+void input_config_clear_keyboard_display_names(void);
+void input_config_set_keyboard_display_name(unsigned idx, const char *name);
+/* NULL if there is no keyboard at that index */
+const char *input_config_get_keyboard_display_name(unsigned idx);
+/* a listed keyboard's USB ids, where the driver knows them; both 0
+ * where it does not */
+void input_config_set_keyboard_ids(unsigned idx, uint16_t vid, uint16_t pid);
+uint16_t input_config_get_keyboard_vid(unsigned idx);
+uint16_t input_config_get_keyboard_pid(unsigned idx);
 
 /**
  * Set the configuration name for the device in the specified port
@@ -1238,6 +1413,38 @@ bool input_key_pressed(int key, bool keyboard_pressed);
 bool input_set_rumble_state(unsigned port,
       enum retro_rumble_effect effect, uint16_t strength);
 
+/* The device registry (input_registry.h): which controllers there are
+ * and which have been here before. It mirrors what the joypad drivers
+ * report; nothing is assigned from it yet. Main thread only. */
+const struct input_registry *input_driver_get_registry(void);
+
+/* A joypad driver's connect or disconnect has been applied to @slot. */
+void input_driver_registry_connect(unsigned slot, const char *provider,
+      const char *name, const char *phys, uint16_t vid, uint16_t pid);
+void input_driver_registry_disconnect(unsigned slot);
+
+/* The joypad driver is about to start over and report its controllers
+ * again. If it reports the ones it had, each goes back to the port it
+ * was on. */
+void input_driver_registry_restart(void);
+
+/* Read controllers through a snapshot taken once a poll, in place of
+ * calls into the joypad driver, whatever the driver. For the harness:
+ * drivers are switched over one at a time as each is checked. */
+void input_driver_set_snapshot_bridge(bool on);
+
+/* The pad index to write to the config file for @port: what the user
+ * configured, which is not what the setting holds while controllers
+ * have been put back on their ports after a driver restart. */
+unsigned input_config_get_saved_joypad_index(unsigned port);
+
+/* Write the rumble strengths a core's calls left this frame. Main
+ * thread, once the core has run. */
+void input_driver_flush_rumble(void);
+
+/* Stop every motor now and drop what was waiting to be written. */
+void input_driver_stop_rumble(void);
+
 bool input_set_rumble_gain(unsigned gain);
 
 float input_get_sensor_state(unsigned port, unsigned id);
@@ -1429,6 +1636,7 @@ extern hid_driver_t iohidmanager_hid;
 extern hid_driver_t btstack_hid;
 extern hid_driver_t libusb_hid;
 extern hid_driver_t wiiusb_hid;
+extern hid_driver_t gekko_hid;
 extern hid_driver_t wiiu_hid;
 #endif /* HAVE_HID */
 

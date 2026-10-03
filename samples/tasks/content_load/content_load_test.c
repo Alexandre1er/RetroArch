@@ -21,7 +21,9 @@
  *  - reinit deferred: a driver reinit asked for while the load is in
  *    flight leaves the drivers as they are - the load rebuilds them;
  *  - fallback: a core that cannot be loaded ends on the dummy core
- *    with the drivers rebuilt and the menu up.
+ *    with the drivers rebuilt and the menu up;
+ *  - not a core: a library that opens but lacks retro_init does the
+ *    same, and the failure is said.
  *
  * Requires a completed non-Qt build:
  *
@@ -620,7 +622,11 @@ static void lane_close_waits_for_save(void)
    pump(1);
    CHECK(runloop_is_content_switching(), "the close did not start a staged load");
 
-   for (i = 0; i < 400 && runloop_is_content_switching(); i++)
+   /* The save is written under the per-frame I/O window, so the frames
+    * it takes follow the machine's speed: a dozen on a release build,
+    * some five hundred under TSan.  The bound only stops a close that
+    * never ends. */
+   for (i = 0; i < 20000 && runloop_is_content_switching(); i++)
    {
       unsigned before = presented;
       pump(1);
@@ -1270,6 +1276,293 @@ static void lane_replay_reply(const char *dir)
 #endif
 
 /* ------------------------------------------------------------------ */
+/* Lane: screenshot steps                                              */
+/* ------------------------------------------------------------------ */
+
+#if defined(HAVE_SCREENSHOTS) && defined(HAVE_RPNG)
+/* A task ahead of the screenshot that spends the shared per-frame I/O
+ * window on every check, so the screenshot's handler gets only the
+ * window's floor: one row a check, on any machine.  The window resets
+ * by the clock; waiting out a whole period first makes this open the
+ * one that starts it, so the screenshot opens well inside the same
+ * window, not across a reset that would hand it a fresh one. */
+static bool ss_hog_stop;
+static void ss_hog_handler(retro_task_t *task)
+{
+   nbio_budget_t b;
+   if (ss_hog_stop)
+   {
+      task_set_flags(task, RETRO_TASK_FLG_FINISHED, true);
+      return;
+   }
+   retro_sleep(17);
+   task_nbio_slice_open(&b);
+   while (task_nbio_slice_within_budget(&b, 0, 0)) { }
+   task_nbio_slice_close(&b);
+}
+
+static bool ss_is_screenshot(retro_task_t *task, void *user_data)
+{
+   if (task->type != TASK_TYPE_BLOCKING)
+      return false;
+   if (user_data)
+      *(retro_task_t**)user_data = task;
+   return true;
+}
+
+static bool ss_in_flight(void)
+{
+   task_finder_data_t find;
+   find.func     = ss_is_screenshot;
+   find.userdata = NULL;
+   return task_queue_find(&find);
+}
+
+static bool ss_png_complete(const char *path)
+{
+   static const uint8_t magic[8] = { 0x89, 'P', 'N', 'G', 13, 10, 26, 10 };
+   uint8_t head[8], tail[8];
+   bool ok = false;
+   FILE *f = fopen(path, "rb");
+   if (!f)
+      return false;
+   if (     fread(head, 1, 8, f) == 8
+         && fseek(f, -8, SEEK_END) == 0
+         && fread(tail, 1, 8, f) == 8)
+      ok = !memcmp(head, magic, 8) && !memcmp(tail, "IEND", 4);
+   fclose(f);
+   return ok;
+}
+
+/* With Threaded Tasks off a screenshot is encoded a slice at a time
+ * from the frame loop, not in one handler call that holds the frame
+ * for the whole deflate; the file it leaves is whole.  Cancelled part
+ * way, it leaves no file. */
+static void lane_screenshot_steps(const char *dir)
+{
+   settings_t *settings = config_get_ptr();
+   retro_task_t *hog;
+   char path[600], file[640];
+   unsigned had = failures, checks = 0, rows = 240;
+
+   if (!core_is_up())
+   {
+      CHECK(task_push_load_contentless_core_from_menu(core_path),
+            "the load was not started");
+      pump(200);
+   }
+   if (menu_is_up())
+      command_event(CMD_EVENT_MENU_TOGGLE, NULL);
+   configuration_set_bool(settings, settings->bools.threaded_data_runloop_enable, false);
+   task_queue_unset_threaded();
+   pump(3);
+
+   ss_hog_stop = false;
+   hog = task_init();
+   hog->handler = ss_hog_handler;
+   hog->flags  |= RETRO_TASK_FLG_MUTE;
+   task_queue_push(hog);
+
+   /* With fullpath the name is the file, as given */
+   snprintf(path, sizeof(path), "%s/harness_shot.png", dir);
+   snprintf(file, sizeof(file), "%s", path);
+   remove(file);
+   CHECK(take_screenshot(dir, path, false, false, true, true),
+         "the screenshot was not started");
+   while (ss_in_flight() && checks < 4 * rows)
+   {
+      task_queue_check();
+      checks++;
+   }
+   CHECK(!ss_in_flight(), "the screenshot did not finish in %u checks", checks);
+   CHECK(checks >= rows,
+         "the screenshot finished in %u checks for %u rows: encoded in one go",
+         checks, rows);
+   CHECK(ss_png_complete(file), "the screenshot file is not a whole PNG");
+   remove(file);
+
+   /* Cancelled part way through */
+   CHECK(take_screenshot(dir, path, false, false, true, true),
+         "the second screenshot was not started");
+   {
+      unsigned n;
+      for (n = 0; n < 20; n++)
+         task_queue_check();
+   }
+   CHECK(ss_in_flight(), "the second screenshot was already done");
+   {
+      retro_task_t *shot = NULL;
+      task_finder_data_t find;
+      find.func     = ss_is_screenshot;
+      find.userdata = &shot;
+      if (task_queue_find(&find) && shot)
+         task_queue_cancel_task(shot);
+   }
+   {
+      unsigned n;
+      for (n = 0; n < 20 && ss_in_flight(); n++)
+         task_queue_check();
+   }
+   CHECK(!ss_in_flight(), "the cancelled screenshot did not retire");
+   CHECK(!path_is_valid(file), "a cancelled screenshot left a partial file");
+
+   ss_hog_stop = true;
+   pump(3);
+
+   if (failures == had)
+      fprintf(stderr, "[pass] screenshot-steps lane (%u checks for %u rows)\n",
+            checks, rows);
+}
+#endif
+
+/* ------------------------------------------------------------------ */
+/* Lane: fallback, threaded                                            */
+/* ------------------------------------------------------------------ */
+
+/* A main-thread task that counts the checks it is run in.  The queue
+ * runs it once per task_queue_check(); more means a handler re-entered
+ * the queue from inside a check. */
+static unsigned probe_runs;
+static bool     probe_stop;
+static void probe_main_handler(retro_task_t *task)
+{
+   probe_runs++;
+   if (probe_stop)
+      task_set_flags(task, RETRO_TASK_FLG_FINISHED, true);
+}
+
+/* A load that fails falls back to the dummy core, and the core stage
+ * deinitialises the old core as it goes - with the close already
+ * through, nothing is left for that to wait on.  With Threaded Tasks
+ * on, the stage runs from inside the check: a wait there would gather
+ * the queue again from within it, running the main-thread tasks a
+ * second time in the same check. */
+static void lane_fallback_threaded(void)
+{
+   settings_t *settings = config_get_ptr();
+   char bogus[512];
+   retro_task_t *probe;
+   unsigned had = failures, checks = 0, n;
+
+   snprintf(bogus, sizeof(bogus), "%.500s.missing", core_path);
+   configuration_set_bool(settings, settings->bools.threaded_data_runloop_enable, true);
+   task_queue_set_threaded();
+   open_menu();
+
+   probe_runs = 0;
+   probe_stop = false;
+   probe = task_init();
+   probe->handler = probe_main_handler;
+   probe->flags  |= RETRO_TASK_FLG_MAIN_THREAD | RETRO_TASK_FLG_MUTE;
+   task_queue_push(probe);
+
+   CHECK(task_push_load_contentless_core_from_menu(bogus),
+         "the load of a missing core was not started");
+   for (n = 0; n < LOAD_FRAMES && runloop_is_content_switching(); n++)
+   {
+      runloop_iterate();
+      task_queue_check();
+      checks++;
+   }
+   CHECK(!runloop_is_content_switching(), "the load did not finish");
+   CHECK(runloop_state_get_ptr()->current_core_type == CORE_TYPE_DUMMY,
+         "the fallback is not the dummy core");
+   CHECK(probe_runs <= checks,
+         "main-thread tasks ran %u times in %u checks: the load re-entered "
+         "the queue from inside a check", probe_runs, checks);
+
+   probe_stop = true;
+   pump(3);
+   CHECK(task_push_load_contentless_core_from_menu(core_path),
+         "the reload after the fallback was not started");
+   pump(LOAD_FRAMES);
+   CHECK(core_is_up(), "the reload after the fallback did not go through");
+   configuration_set_bool(settings, settings->bools.threaded_data_runloop_enable, false);
+   task_queue_unset_threaded();
+   pump(2);
+
+   if (failures == had)
+      fprintf(stderr, "[pass] fallback-threaded lane (%u checks)\n", checks);
+}
+
+/* ------------------------------------------------------------------ */
+/* Lane: not a core                                                    */
+/* ------------------------------------------------------------------ */
+
+/* Empties the message queue: true when a message on it held @want. */
+static bool queued_message(const char *want)
+{
+   runloop_state_t *runloop_st = runloop_state_get_ptr();
+   bool found                  = false;
+   const char *m;
+   while ((m = msg_queue_pull(&runloop_st->msg_queue)))
+      if (strstr(m, want))
+         found = true;
+   return found;
+}
+
+/* A library that opens but is not a core - it lacks retro_init - is
+ * found out only once the load has committed and the old session is
+ * gone.  The load falls back to the dummy core: drivers come back, the
+ * menu runs against them, and the failure is said.  Frames go on
+ * being presented throughout. */
+static void lane_not_a_core(void)
+{
+   struct load_frame log[LOAD_FRAMES];
+   char noinit[600];
+   const char *slash = strrchr(core_path, '/');
+   unsigned n, i, presented_frames = 0;
+   unsigned had          = failures;
+   settings_t *settings = config_get_ptr();
+   bool font_enable     = settings->bools.video_font_enable;
+
+   snprintf(noinit, sizeof(noinit), "%.*s/harness_core_noinit.so",
+         slash ? (int)(slash - core_path) : 1, slash ? core_path : ".");
+   CHECK(path_is_valid(noinit), "no %s: build.sh builds it", noinit);
+
+   open_menu();
+   hook_install();
+   queued_message("");   /* nothing left over from earlier lanes */
+   /* Frames show queued messages on the OSD, taking them off the
+    * queue; with it off they stay there to be read here. */
+   settings->bools.video_font_enable = false;
+
+   CHECK(task_push_load_contentless_core_from_menu(noinit),
+         "the load of a library that is not a core was not started");
+   n = run_load(log, LOAD_FRAMES);
+   for (i = 0; i < n; i++)
+      presented_frames += log[i].presented;
+   CHECK(n < LOAD_FRAMES && !runloop_is_content_switching(),
+         "the load did not finish within %u frames", LOAD_FRAMES);
+   CHECK(queued_message(msg_hash_to_str(MSG_FAILED_TO_LOAD_CONTENT)),
+         "the failure was not said");
+   CHECK(video_state_get_ptr()->data != NULL,
+         "no video driver after the failed load");
+   CHECK(input_state_get_ptr()->current_data != NULL,
+         "no input driver after the failed load");
+   CHECK(runloop_state_get_ptr()->current_core_type == CORE_TYPE_DUMMY,
+         "the failed load did not fall back to the dummy core");
+   CHECK(presented_frames >= 1, "no frame presented during the fallback");
+   settings->bools.video_font_enable = font_enable;
+   runloop_iterate();
+   task_queue_check();
+   CHECK(menu_is_up(), "menu not up after a failed load");
+
+   /* And the real core loads again. */
+   CHECK(task_push_load_contentless_core_from_menu(core_path),
+         "the reload after the failed load was not started");
+   n = run_load(log, LOAD_FRAMES);
+   CHECK(n < LOAD_FRAMES && core_is_up()
+         && runloop_state_get_ptr()->current_core_type != CORE_TYPE_DUMMY,
+         "the reload after the failed load did not go through");
+   runloop_iterate();
+
+   if (failures == had)
+      fprintf(stderr, "[pass] not-a-core lane (%u presented)\n",
+            presented_frames);
+}
+
+/* ------------------------------------------------------------------ */
 /* Lane: close content                                                 */
 /* ------------------------------------------------------------------ */
 
@@ -1385,6 +1678,7 @@ int main(int argc, char *argv[])
    retroarch_config_init();
    retroarch_ctl(RARCH_CTL_STATE_FREE, NULL);
    frontend_driver_init_first(NULL);
+   runloop_msg_queue_init();   /* as rarch_main() does */
 
    rarch_argv[rarch_argc++] = (char*)"retroarch";
    rarch_argv[rarch_argc++] = (char*)"--config";
@@ -1431,6 +1725,8 @@ int main(int argc, char *argv[])
    lane_one_at_a_time();
    lane_reinit_deferred();
    lane_fallback();
+   lane_fallback_threaded();
+   lane_not_a_core();
    lane_hw_request();
    lane_queue_survives();
    lane_close_content();
@@ -1441,6 +1737,9 @@ int main(int argc, char *argv[])
    lane_acceptance(dir);
 #ifdef HAVE_BSV_MOVIE
    lane_replay_reply(dir);
+#endif
+#if defined(HAVE_SCREENSHOTS) && defined(HAVE_RPNG)
+   lane_screenshot_steps(dir);
 #endif
 
    main_exit(NULL);

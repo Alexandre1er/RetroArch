@@ -535,14 +535,11 @@ static int action_start_menu_wallpaper(
       unsigned type, size_t idx, size_t entry_idx)
 {
    settings_t *settings       = config_get_ptr();
-   struct menu_state *menu_st = menu_state_get_ptr();
 
    settings->paths.path_menu_wallpaper[0] = '\0';
 
-   /* Reset wallpaper by menu context reset */
-   if (menu_st->driver_ctx && menu_st->driver_ctx->context_reset)
-      menu_st->driver_ctx->context_reset(menu_st->userdata,
-            video_driver_is_threaded());
+   /* Reset wallpaper by menu context rebuild */
+   menu_driver_context_rebuild();
 
    return 0;
 }
@@ -630,10 +627,15 @@ static int action_start_video_resolution(
 {
    unsigned dims = 0;
    char desc[64] = {0};
-   global_t *global = global_get_ptr();
+#if defined(PS2)
+   config_get_ptr()->uints.video_ps2_mode = 0;
+#else
+   settings_t *settings = config_get_ptr();
 
-   /*  Reset the resolution id to zero */
-   global->console.screen.resolutions.current.id = 0;
+   /* The display's own mode */
+   settings->uints.video_fullscreen_x = 0;
+   settings->uints.video_fullscreen_y = 0;
+#endif
 
    if (video_driver_get_video_output_size(&dims, desc, sizeof(desc)))
    {

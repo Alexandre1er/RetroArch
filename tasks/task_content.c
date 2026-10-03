@@ -15,8 +15,6 @@
  *  If not, see <http://www.gnu.org/licenses/>.
  */
 
-/* TODO/FIXME - turn this into actual task */
-
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -74,6 +72,15 @@
 
 #ifdef HAVE_GFX_WIDGETS
 #include "../gfx/gfx_widgets.h"
+#endif
+
+#ifdef HAVE_WAYLAND
+/* gfx/common/wayland_common.c */
+void gfx_ctx_wl_release_kept(void);
+#endif
+#if defined(_WIN32) && !defined(_XBOX) && !defined(__WINRT__) && !defined(WINAPI_FAMILY)
+/* gfx/common/win32_common.c */
+void win32_window_release_kept(void);
 #endif
 
 #if defined(HAVE_CG) || defined(HAVE_GLSL) || defined(HAVE_SLANG) || defined(HAVE_HLSL)
@@ -2049,6 +2056,7 @@ struct content_load_job
    bool staged;     /* advanced from the frame loop; else run in one go */
    bool verbosity;
    bool ok;
+   bool fell_back;  /* the core failed; the dummy core took its place */
 };
 
 /* One load at a time: an entry point called while a job is in flight
@@ -2070,10 +2078,8 @@ static void content_load_job_free(struct content_load_job *job)
    job->stage     = CONTENT_LOAD_STAGE_NONE;
 }
 
-/* The close of the old session.  Staged, the drivers stay up
- * (runloop_event_deinit_core keys off content_switching) and keep
- * presenting until the driver stage. */
-static bool content_load_stage_deinit(struct content_load_job *job)
+/* The arguments the core stage parses, from the job's content info. */
+static void content_load_job_args(struct content_load_job *job)
 {
    struct rarch_main_wrap *wrap_args = job->wrap_args;
 
@@ -2095,6 +2101,55 @@ static bool content_load_stage_deinit(struct content_load_job *job)
 
    wrap_args->argc = *job->argc_ptr;
    wrap_args->argv = job->argv_ptr;
+}
+
+void menu_content_environment_get(int *argc, char *argv[],
+      void *args, void *params_data);
+
+/* The core stage failed after the old session was closed - a library
+ * that opened and then turned out not to be a core, say.  The load
+ * lands on the dummy core instead, as every caller already allows for:
+ * the drivers come back and the menu has something to run against. */
+static void content_load_job_fall_back(struct content_load_job *job)
+{
+   struct rarch_main_wrap *wrap_args = job->wrap_args;
+   size_t i;
+
+   for (i = 0; i < ARRAY_SIZE(job->argv_copy); i++)
+   {
+      free(job->argv_copy[i]);
+      job->argv_copy[i] = NULL;
+   }
+   memset(job->rarch_argv, 0, sizeof(job->rarch_argv));
+   job->rarch_argc          = 0;
+   wrap_args->argv          = NULL;
+   wrap_args->content_path  = NULL;
+   wrap_args->sram_path     = NULL;
+   wrap_args->state_path    = NULL;
+   wrap_args->config_path   = NULL;
+   wrap_args->libretro_path = NULL;
+   wrap_args->flags         = 0;
+   wrap_args->argc          = 0;
+
+   job->info.argc           = 0;
+   job->info.argv           = NULL;
+   job->info.args           = NULL;
+   job->info.environ_get    = menu_content_environment_get;
+   job->argv_ptr            = NULL;
+   job->argc_ptr            = &job->info.argc;
+   job->fell_back           = true;
+
+   path_clear(RARCH_PATH_CONTENT);
+   runloop_set_current_core_type(CORE_TYPE_DUMMY, true);
+   content_load_job_args(job);
+}
+
+/* The close of the old session.  Staged, the drivers stay up
+ * (runloop_event_deinit_core keys off content_switching) and keep
+ * presenting until the driver stage. */
+static bool content_load_stage_deinit(struct content_load_job *job)
+{
+   content_load_job_args(job);
 
    /* Staged, a save or load state task still inside the core is
     * waited out from the frame loop, one check per frame; in one go,
@@ -2196,6 +2251,19 @@ static void content_load_finish(struct content_load_job *job,
    if (ok)
       content_load_tail(job, p_content);
 
+   /* The core asked for failed and the dummy core took its place: the
+    * load failed, said now that there are drivers to say it on. */
+   if (job->fell_back)
+   {
+      if (ok)
+      {
+         const char *_msg = msg_hash_to_str(MSG_FAILED_TO_LOAD_CONTENT);
+         runloop_msg_queue_push(_msg, strlen(_msg), 2, 180, true, NULL,
+               MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_ERROR);
+      }
+      ok = false;
+   }
+
    /* A load that fell back to the dummy core did not start the core
     * the caller asked for. */
    if (     ok
@@ -2255,11 +2323,29 @@ static void content_load_step(struct content_load_job *job,
          job->ok = content_load_stage_core(job);
          if (!job->ok)
          {
+            if (     !job->fell_back
+                  && runloop_state_get_ptr()->current_core_type
+                        != CORE_TYPE_DUMMY)
+            {
+               /* The stage runs again, for the dummy core. */
+               content_load_job_fall_back(job);
+               break;
+            }
             /* Not even the dummy core: no session to build drivers
              * for, and the previous session's are freed as an
              * unstaged failure leaves them. */
             if (job->staged)
                driver_uninit(DRIVERS_CMD_ALL, (enum driver_lifetime_flags)0);
+#ifdef HAVE_WAYLAND
+            /* Nothing is coming for the window kept across the
+             * reinit: hand it back, and webOS returns to its
+             * dashboard rather than a window nothing draws into. */
+            gfx_ctx_wl_release_kept();
+#endif
+#if defined(_WIN32) && !defined(_XBOX) && !defined(__WINRT__) && !defined(WINAPI_FAMILY)
+            /* nor for a Windows one */
+            win32_window_release_kept();
+#endif
             content_load_finish(job, p_content);
             break;
          }
@@ -3269,7 +3355,7 @@ static bool task_content_defer_menu_load(content_state_t *p_content,
     * off, nothing is shown and no progress is reported.
     *
     * Widgets persist across the driver reinit the load performs
-    * (DISPGFX_WIDGET_FLAG_PERSISTING), so the card started here
+    * (dispgfx_widget_t.persisting), so the card started here
     * survives into the loaded core. */
    {
       settings_t *settings = config_get_ptr();
@@ -3461,7 +3547,6 @@ bool task_push_load_content_with_new_core_from_companion_ui(
       retro_task_callback_t cb,
       void *user_data)
 {
-   global_t *global            = global_get_ptr();
    runloop_state_t *runloop_st = runloop_state_get_ptr();
    content_state_t  *p_content = content_state_get_ptr();
 
@@ -3483,7 +3568,7 @@ bool task_push_load_content_with_new_core_from_companion_ui(
    command_event(CMD_EVENT_LOAD_CORE, NULL);
 #endif
 
-   global->flags &= ~GLOB_FLG_LAUNCHED_FROM_CLI;
+   retroarch_ctl(RARCH_CTL_UNSET_LAUNCHED_FROM_CLI, NULL);
 
    if (label)
       strlcpy(runloop_st->name.label, label, sizeof(runloop_st->name.label));

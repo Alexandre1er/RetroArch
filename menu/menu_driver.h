@@ -495,6 +495,14 @@ struct menu_state
 {
    /* Timers */
    retro_time_t current_time_us;
+   /* Time of the input poll whose state menu_event() reads this
+    * frame, and of the poll taken for the next frame. The menu
+    * collects its input before polling, so the state it acts on is
+    * one poll old; navigation auto-repeat measures a hold between
+    * polls so that a stall after the last poll is not counted as
+    * time the button was held. */
+   retro_time_t input_time_us;
+   retro_time_t input_poll_time_us;
    retro_time_t powerstate_last_time_us;
    retro_time_t datetime_last_time_us;
    retro_time_t input_last_time_us;
@@ -687,6 +695,10 @@ int menu_driver_deferred_push_content_list(file_list_t *list);
 
 bool menu_driver_init(bool video_is_threaded);
 
+/* Rebuilds the menu driver's GPU-side context (textures, fonts) against
+ * the running video driver, releasing the old one first. */
+void menu_driver_context_rebuild(void);
+
 retro_time_t menu_driver_get_current_time(void);
 
 size_t menu_display_timedate(gfx_display_ctx_datetime_t *datetime, char *s, size_t len);
@@ -724,6 +736,16 @@ void menu_driver_get_last_shader_pass_path(
 void menu_driver_set_pending_selection(const char *pending_selection);
 
 struct menu_state *menu_state_get_ptr(void);
+
+/* Hands @payload (local UTF-8 paths) to the selected menu entry on
+ * the next menu frame. Any thread; takes ownership of @payload.
+ * Returns false when the menu is not open, so the caller can fall
+ * back to its own handling. */
+bool menu_driver_drop(struct string_list *payload);
+
+/* As menu_driver_drop(), for the file:// entries of a text/uri-list.
+ * Decodes @list in place. */
+bool menu_driver_drop_uri_list(char *list);
 
 int generic_menu_entry_action(void *userdata, menu_entry_t *entry, size_t i, enum menu_action action);
 

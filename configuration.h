@@ -85,6 +85,13 @@ enum crt_switch_type
    CRT_SWITCH_LCD
 };
 
+/* The rate the menu runs at while content is loaded */
+enum menu_frame_rate_mode
+{
+   MENU_FRAME_RATE_DISPLAY = 0,
+   MENU_FRAME_RATE_CONTENT
+};
+
 enum video_sdl_display_server_mode
 {
    VIDEO_SDL_DISPLAY_SERVER_OFF = 0,
@@ -150,6 +157,10 @@ typedef struct settings
       unsigned input_joypad_index[MAX_USERS];
       unsigned input_device[MAX_USERS];
       unsigned input_mouse_index[MAX_USERS];
+      /* The keyboard a port reads, where the input driver can tell
+       * keyboards apart: 0 for all of them as one (the default), N
+       * for the Nth the driver lists. */
+      unsigned input_keyboard_index[MAX_USERS];
 
       unsigned input_libretro_device[MAX_USERS];
       unsigned input_analog_dpad_mode[MAX_USERS];
@@ -264,6 +275,9 @@ typedef struct settings
       unsigned video_hard_sync_frames;
       unsigned video_frame_delay;
       unsigned video_viwidth;
+      unsigned video_ps2_mode;
+      unsigned video_gamma;
+      unsigned video_flicker_filter;
       unsigned video_aspect_ratio_idx;
       unsigned video_rotation;
       unsigned video_fse_negotiation;
@@ -295,6 +309,7 @@ typedef struct settings
       unsigned accessibility_narrator_engine;
 
       unsigned menu_timedate_style;
+      unsigned menu_frame_rate;
       unsigned menu_timedate_date_separator;
       unsigned gfx_thumbnails;
       unsigned menu_left_thumbnails;
@@ -445,6 +460,9 @@ typedef struct settings
       unsigned nfs_readahead;
 #endif
       unsigned input_sensor_orientation;
+#ifdef ANDROID
+      unsigned input_stylus_pressure_sensitivity;
+#endif
    } uints;
 
    struct
@@ -609,6 +627,8 @@ typedef struct settings
       bool video_hard_sync;
       bool video_waitable_swapchains;
       bool video_vfilter;
+      bool video_soft_filter;
+      bool video_pal60_enable;
       bool video_smooth;
       bool video_ctx_scaling;
       bool video_force_aspect;
@@ -804,7 +824,6 @@ typedef struct settings
 #endif
       bool menu_show_information;
       bool menu_show_configurations;
-      bool menu_show_help;
       bool menu_show_quit_retroarch;
       bool menu_show_restart_retroarch;
       bool menu_show_reboot;
@@ -941,6 +960,7 @@ typedef struct settings
       bool network_buildbot_show_experimental_cores;
       bool network_on_demand_thumbnails;
       bool core_updater_auto_backup;
+      bool core_updater_auto_backup_compress;
 
       /* UI */
       bool ui_menubar_enable;
@@ -1025,7 +1045,6 @@ typedef struct settings
       bool rewind_enable;
       bool fastforward_frameskip;
       bool vrr_runloop_enable;
-      bool menu_throttle_framerate;
       bool apply_cheats_after_toggle;
       bool apply_cheats_after_load;
       bool run_ahead_enabled;
@@ -1146,6 +1165,9 @@ typedef struct settings
 
 #ifdef ANDROID
       bool android_input_disconnect_workaround;
+      bool input_stylus_enable;
+      bool input_stylus_require_contact_for_click;
+      bool input_stylus_hover_moves_pointer;
 #endif
 
 #if defined(HAVE_COCOATOUCH)
@@ -1546,8 +1568,9 @@ void config_get_autoconf_profile_filename(
 /**
  * config_save_autoconf_profile:
  * @device_name       : Input device name
- * @user              : Controller number to save
- * Writes a controller autoconf file to disk.
+ * @user              : Port whose binds are saved
+ * Writes a controller autoconf file to disk for the
+ * device assigned to @user.
  **/
 bool config_save_autoconf_profile(const char *device_name, unsigned user);
 
@@ -1590,9 +1613,9 @@ bool config_overlay_enable_default(void);
 bool config_metal_arg_buffers_default(void);
 #endif
 
-void config_set_defaults(void *data, settings_t *target);
+void config_set_defaults(settings_t *target);
 
-void config_load(void *data);
+void config_load(void);
 
 #if !defined(HAVE_DYNAMIC)
 /* Salamander config file contains a single

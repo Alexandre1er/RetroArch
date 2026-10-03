@@ -51,6 +51,7 @@
 #include "input/common/wayland_common_webos.h"
 #endif
 
+#include <setjmp.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
@@ -351,6 +352,10 @@ extern const bluetooth_driver_t *bluetooth_drivers[];
 /* MAIN GLOBAL VARIABLES */
 struct rarch_state
 {
+   /* retroarch_fail() lands here while retroarch_main_init runs
+    * (RARCH_FLAGS_INIT_IN_PROGRESS) */
+   jmp_buf error_sjlj_context;
+
    char *connect_host; /* Netplay hostname passed from CLI */
    char *connect_mitm_id; /* Netplay MITM address from CLI */
 
@@ -359,6 +364,7 @@ struct rarch_state
    unsigned perf_ptr_rarch;
    uint32_t flags;
 
+   char error_string[NAME_MAX_LENGTH];
    char launch_arguments[4096];
    char path_default_shader_preset[PATH_MAX_LENGTH];
    char path_content[PATH_MAX_LENGTH];
@@ -382,7 +388,6 @@ void libnx_apply_overclock(void);
 static struct rarch_state rarch_st        = {0};
 
 static access_state_t access_state_st     = {0};
-static struct global global_driver_st     = {0}; /* retro_time_t alignment */
 
 static void retro_frame_null(const void *data, unsigned width,
       unsigned height, size_t pitch) { }
@@ -1636,7 +1641,7 @@ void drivers_init(
    bool menu_enable_widgets       = settings->bools.menu_enable_widgets;
    dispgfx_widget_t *p_dispwidget = dispwidget_get_ptr();
    /* By default, we want display widgets to persist through driver reinits. */
-   p_dispwidget->flags           |= DISPGFX_WIDGET_FLAG_PERSISTING;
+   p_dispwidget->persisting       = true;
 #endif
 #ifdef HAVE_MENU
    /* By default, we want the menu to persist through driver reinits. */
@@ -1665,6 +1670,9 @@ void drivers_init(
       if (!video_driver_init_internal(&video_is_threaded,
                verbosity_enabled))
          retroarch_fail(1, "video_driver_init_internal()");
+      /* An input driver kept across the restart has been handed back
+       * by now; if nothing took it, it is not left behind. */
+      input_driver_drop_kept();
 
 #ifdef HAVE_THREADS
       /* An OpenGL core under the threaded wrapper renders on this
@@ -1934,7 +1942,7 @@ void driver_uninit(int flags, enum driver_lifetime_flags lifetime_flags)
     * (e.g. Vulkan) will segfault */
    if (p_dispwidget->flags & DISPGFX_WIDGET_FLAG_INITED)
    {
-      gfx_widgets_deinit(p_dispwidget->flags & DISPGFX_WIDGET_FLAG_PERSISTING);
+      gfx_widgets_deinit(p_dispwidget->persisting);
       p_dispwidget->active = false;
    }
 #endif
@@ -2014,6 +2022,14 @@ void driver_uninit(int flags, enum driver_lifetime_flags lifetime_flags)
        * cached frame can point into (a lent software framebuffer),
        * so retire while that memory is still mapped. */
       video_driver_cached_frame_retire();
+      /* An input driver that can be left running stays, when the
+       * video driver is coming straight back: a restart, or content
+       * loaded or closed. */
+      input_driver_keep_for_video_restart(
+               (lifetime_flags & (DRIVER_LIFETIME_RESET
+                                | DRIVER_LIFETIME_SESSION_SWITCH))
+            && (flags & DRIVER_VIDEO_MASK),
+            video_st->data);
       video_driver_free_internal();
 #ifdef HAVE_THREADS
 #ifndef RETRO_ATOMIC_HAS_PTR
@@ -2029,7 +2045,9 @@ void driver_uninit(int flags, enum driver_lifetime_flags lifetime_flags)
    if (flags & DRIVER_AUDIO_MASK)
       audio_driver_deinit();
 
-   if ((flags & DRIVER_INPUT_MASK))
+   /* (a driver kept across the restart keeps its data) */
+   if (     (flags & DRIVER_INPUT_MASK)
+         && !input_state_get_ptr()->kept_driver)
       input_state_get_ptr()->current_data = NULL;
 
    if ((flags & DRIVER_AUDIO_MASK))
@@ -2069,8 +2087,7 @@ static void retroarch_deinit_drivers(struct retro_callbacks *cbs)
    dispgfx_widget_t *p_dispwidget  = dispwidget_get_ptr();
    if (p_dispwidget->flags & DISPGFX_WIDGET_FLAG_INITED)
    {
-      gfx_widgets_deinit(
-            p_dispwidget->flags & DISPGFX_WIDGET_FLAG_PERSISTING);
+      gfx_widgets_deinit(p_dispwidget->persisting);
       p_dispwidget->active         = false;
    }
 #endif
@@ -2228,12 +2245,6 @@ bool driver_ctl(enum driver_ctl_state state, void *data)
 access_state_t *access_state_get_ptr(void)
 {
    return &access_state_st;
-}
-
-/* GLOBAL POINTER GETTERS */
-global_t *global_get_ptr(void)
-{
-   return &global_driver_st;
 }
 
 uint32_t retroarch_get_flags(void)
@@ -3385,10 +3396,40 @@ static bool command_event_core_deinit_pending(void)
 
 static void command_event_finish_content_deinit(void);
 
+#if defined(HAVE_SMBCLIENT) || defined(HAVE_NFSCLIENT)
+/* How much of what the content read over the network read-ahead had
+ * ready, so a user can tell whether a window size helps: logged once
+ * the core has closed its files, and only while read-ahead is on. */
+static void command_event_log_readahead(const char *proto,
+      unsigned window_kib, unsigned direct_kib)
+{
+   unsigned total = window_kib + direct_kib;
+   if (!total)
+      return;
+   RARCH_LOG("[%s] Read-ahead: %u of %u KiB read came from its window (%u%%).\n",
+         proto, window_kib, total,
+         (unsigned)(((uint64_t)window_kib * 100 + total / 2) / total));
+}
+#endif
+
 static void command_event_core_deinit_finish(void)
 {
    runloop_state_t *runloop_st = runloop_state_get_ptr();
    command_event_finish_content_deinit();
+#ifdef HAVE_SMBCLIENT
+   {
+      unsigned w, d;
+      smb_take_readahead_stats(&w, &d);
+      command_event_log_readahead("SMB", w, d);
+   }
+#endif
+#ifdef HAVE_NFSCLIENT
+   {
+      unsigned w, d;
+      nfs_take_readahead_stats(&w, &d);
+      command_event_log_readahead("NFS", w, d);
+   }
+#endif
    runloop_st->content_closing = false;
 }
 
@@ -4247,9 +4288,17 @@ bool command_event(enum event_command cmd, void *data)
                content_clear_subsystem();
             }
 #ifdef HAVE_CLOUDSYNC
-            /* Sync on core unload if in automatic mode */
+            /* Sync on core unload if in automatic mode.  With content
+             * running, its save RAM reaches disk, and stops belonging
+             * to a core, only when its deinit finishes, a frame or more
+             * from now; the sync is pushed from there. */
             if (settings->uints.cloud_sync_sync_mode == CLOUD_SYNC_MODE_AUTOMATIC)
-               task_push_cloud_sync();
+            {
+               if (flags & CONTENT_ST_FLAG_IS_INITED)
+                  rarch_st.flags |= RARCH_FLAGS_CLOUD_SYNC_ON_DEINIT;
+               else
+                  task_push_cloud_sync();
+            }
 #endif
          }
 
@@ -4283,7 +4332,7 @@ bool command_event(enum event_command cmd, void *data)
 
 #if defined(HAVE_GFX_WIDGETS)
          /* Remove stale notifications after reinit */
-         dispwidget_get_ptr()->flags &= ~DISPGFX_WIDGET_FLAG_PERSISTING;
+         dispwidget_get_ptr()->persisting = false;
 #endif
 
 #else
@@ -4620,7 +4669,7 @@ bool command_event(enum event_command cmd, void *data)
 #endif
          break;
       case CMD_EVENT_RELOAD_CONFIG:
-         config_load(global_get_ptr());
+         config_load();
          break;
       case CMD_EVENT_DSP_FILTER_INIT:
 #ifdef HAVE_DSP_FILTER
@@ -4822,6 +4871,12 @@ bool command_event(enum event_command cmd, void *data)
          break;
       case CMD_EVENT_CORE_DEINIT:
          command_event_core_deinit_begin();
+         /* A state task calls into the core this unloads.  Reached
+          * when an init fails, and from a staged load's core stage -
+          * after its close has waited the state tasks out from the
+          * frame loop, so there is nothing left to wait for.  The
+          * interactive close goes through retroarch_main_deinit_begin /
+          * _pending / _finish instead. */
          content_wait_for_save_state_task();
          content_wait_for_load_state_task();
          command_event_core_deinit_finish();
@@ -5190,7 +5245,10 @@ bool command_event(enum event_command cmd, void *data)
          break;
 #endif
       case CMD_EVENT_MENU_RESET_TO_DEFAULT_CONFIG:
-         config_set_defaults(global_get_ptr(), config_get_ptr());
+         config_set_defaults(config_get_ptr());
+         /* that reset the controllers' configuration, which they get
+          * back when the joypad driver next starts */
+         input_driver_restart_with_next_video_restart();
          break;
       case CMD_EVENT_MENU_SAVE_CURRENT_CONFIG:
          /* Same as at quit: the companion's live layout first. */
@@ -5656,9 +5714,22 @@ bool command_event(enum event_command cmd, void *data)
             if (ra_is_forced_fs)
                video_driver_modify_disp_flags(0, VIDEO_FLAG_FORCE_FULLSCREEN);
 
-            /* If we go fullscreen we drop all drivers and
-             * reinitialize to be safe. */
-            command_event(CMD_EVENT_REINIT, NULL);
+            /* Where the window can change state in place - borderless
+             * fullscreen on a context that says so - that is all a
+             * toggle is: the window is restyled and the video driver
+             * sees a resize. Device, shaders, audio and input drivers
+             * stay as they are.
+             *
+             * Otherwise (exclusive fullscreen, which changes the
+             * display mode, or a context without the means) all
+             * drivers are dropped and reinitialised, as before. */
+            if (     !settings->bools.video_windowed_fullscreen
+                  || !video_driver_test_all_flags(
+                        GFX_CTX_FLAGS_FULLSCREEN_IN_PLACE)
+                  || !video_driver_set_video_mode(
+                        video_driver_window_dims(new_fullscreen_state),
+                        new_fullscreen_state))
+               command_event(CMD_EVENT_REINIT, NULL);
             if (video_fullscreen)
             {
                if (     video_st->poke
@@ -5821,15 +5892,7 @@ bool command_event(enum event_command cmd, void *data)
          }
          break;
       case CMD_EVENT_RUMBLE_STOP:
-         {
-            unsigned i;
-            for (i = 0; i < MAX_USERS; i++)
-            {
-               unsigned joy_idx = settings->uints.input_joypad_index[i];
-               input_driver_set_rumble(i, joy_idx, RETRO_RUMBLE_STRONG, 0);
-               input_driver_set_rumble(i, joy_idx, RETRO_RUMBLE_WEAK, 0);
-            }
-         }
+         input_driver_stop_rumble();
          break;
       case CMD_EVENT_TURBO_FIRE_TOGGLE:
          configuration_set_bool(settings,
@@ -6030,6 +6093,13 @@ bool command_event(enum event_command cmd, void *data)
                      settings,
                      &runloop_st->fastmotion_override.current));
          }
+         break;
+      case CMD_EVENT_CAMERA_ALLOW_APPLY:
+         /* Allowing again does nothing by itself: the core has to call
+          * start() for the camera to come up, and that start raises
+          * the bit. Disallowing stops a camera that is running. */
+         if (!settings->bools.camera_allow)
+            driver_camera_stop();
          break;
       case CMD_EVENT_DISCORD_INIT:
 #ifdef HAVE_DISCORD
@@ -6338,7 +6408,6 @@ static void retroarch_override_setting_free_state(void)
 
 static void global_free(struct rarch_state *p_rarch)
 {
-   global_t            *global = NULL;
    runloop_state_t *runloop_st = runloop_state_get_ptr();
 
    content_deinit();
@@ -6372,7 +6441,6 @@ static void global_free(struct rarch_state *p_rarch)
    runloop_st->current_core.flags &= ~(RETRO_CORE_FLAG_HAS_SET_INPUT_DESCRIPTORS
                                      | RETRO_CORE_FLAG_HAS_SET_SUBSYSTEMS);
 
-   global                                = global_get_ptr();
    path_clear_all();
    dir_clear_all();
 
@@ -6389,8 +6457,12 @@ static void global_free(struct rarch_state *p_rarch)
    *runloop_st->name.cheatfile           = '\0';
    *runloop_st->name.label               = '\0';
 
-   if (global)
-      memset(global, 0, sizeof(struct global));
+   p_rarch->flags                       &= ~(
+                          RARCH_FLAGS_ERR_ON_INIT
+                        | RARCH_FLAGS_LAUNCHED_FROM_CLI
+                        | RARCH_FLAGS_CLI_LOAD_MENU_ON_ERR
+                        | RARCH_FLAGS_INIT_IN_PROGRESS);
+   *p_rarch->error_string                = '\0';
    retroarch_override_setting_free_state();
 }
 
@@ -6460,7 +6532,7 @@ void main_exit(void *args)
          video_thread_wait_idle();
    }
 #endif
-   dispwidget_get_ptr()->flags &= ~DISPGFX_WIDGET_FLAG_PERSISTING;
+   dispwidget_get_ptr()->persisting = false;
 #endif
 #ifdef HAVE_MENU
    /* Do not want menu context to live any more. */
@@ -6491,13 +6563,15 @@ void main_exit(void *args)
 
    p_rarch->flags                  &= ~RARCH_FLAGS_HAS_SET_USERNAME;
    runloop_is_inited_clear();
-   global_get_ptr()->flags         &= ~GLOB_FLG_ERR_ON_INIT;
+   rarch_st.flags         &= ~RARCH_FLAGS_ERR_ON_INIT;
 #ifdef HAVE_CONFIGFILE
    p_rarch->flags                  &= ~RARCH_FLAGS_BLOCK_CONFIG_READ;
 #endif
 
    runloop_msg_queue_deinit();
    driver_uninit(DRIVERS_CMD_ALL, (enum driver_lifetime_flags)0);
+   /* an input driver kept for drivers that then failed to start */
+   input_driver_drop_kept();
 
    retro_main_log_file_deinit();
 
@@ -7286,7 +7360,13 @@ static void retroarch_print_help(const char *arg0)
          "                                 "
          "  config selected in -c (or default). Multiple configs are\n"
          "                                 "
-         "  delimited by '|'.\n");
+         "  delimited by '|'. Their settings are written to the main\n"
+         "                                 "
+         "  config whenever it is saved, on exit included. To keep\n"
+         "                                 "
+         "  them out of it, put config_save_on_exit = \"false\" in\n"
+         "                                 "
+         "  the appended file.\n");
 #endif
 
    fputs(buf, stdout);
@@ -7663,7 +7743,6 @@ void handle_dbscan_finished(retro_task_t *task,
  **/
 static bool retroarch_parse_input_and_config(
       struct rarch_state *p_rarch,
-      global_t *global,
       int argc, char *argv[])
 {
    unsigned i;
@@ -7813,7 +7892,7 @@ static bool retroarch_parse_input_and_config(
 #ifdef HAVE_CONFIGFILE
    runloop_st->flags              &= ~RUNLOOP_FLAG_OVERRIDES_ACTIVE;
 #endif
-   global->flags                  &= ~GLOB_FLG_CLI_LOAD_MENU_ON_ERR;
+   rarch_st.flags                  &= ~RARCH_FLAGS_CLI_LOAD_MENU_ON_ERR;
 
    /* Make sure we can call retroarch_parse_input several times ... */
    optind                          = 0;
@@ -7974,7 +8053,7 @@ static bool retroarch_parse_input_and_config(
 #if !defined(HAVE_DYNAMIC)
       config_load_file_salamander();
 #endif
-      config_load(global_get_ptr());
+      config_load();
       /* The network clients took their settings before the file was
        * read (the string fields point at the live buffers, the numeric
        * ones were copied); hand them the loaded values. */
@@ -8344,7 +8423,7 @@ static bool retroarch_parse_input_and_config(
 #endif
                break;
             case RA_OPT_LOAD_MENU_ON_ERROR:
-               global->flags |= GLOB_FLG_CLI_LOAD_MENU_ON_ERR;
+               rarch_st.flags |= RARCH_FLAGS_CLI_LOAD_MENU_ON_ERR;
                break;
             case 'e':
                {
@@ -8365,9 +8444,6 @@ static bool retroarch_parse_input_and_config(
 #ifdef HAVE_LIBRETRODB
                {
                   settings_t *settings           = config_get_ptr();
-                  bool show_hidden_files         = settings->bools.show_hidden_files;
-                  const char *directory_playlist = settings->paths.directory_playlist;
-                  const char *path_content_db    = settings->paths.path_content_database;
                   int reinit_flags               = DRIVERS_CMD_ALL &
                         ~(DRIVER_VIDEO_MASK | DRIVER_AUDIO_MASK | DRIVER_MICROPHONE_MASK | DRIVER_INPUT_MASK | DRIVER_MIDI_MASK);
 
@@ -8379,15 +8455,13 @@ static bool retroarch_parse_input_and_config(
                      cb_task_dbscan = handle_dbscan_finished;
 #endif
 
-                  task_push_dbscan(
-                        directory_playlist,
-                        path_content_db,
-                        optarg, path_is_directory(optarg),
-                        show_hidden_files,
-                        cb_task_dbscan);
+                  task_push_dbscan(optarg, cb_task_dbscan);
 
                   if (!explicit_menu)
                   {
+                     /* Command-line scan with no menu: the scan is
+                      * the whole run, so run the queue dry and exit.
+                      * Nothing is drawn meanwhile. */
                      task_queue_wait(NULL, NULL);
                      driver_uninit(DRIVERS_CMD_ALL, (enum driver_lifetime_flags)0);
                      exit(0);
@@ -8473,9 +8547,9 @@ static bool retroarch_parse_input_and_config(
    /* Update global 'content launched from command
     * line' status flag */
    if (cli_active && (cli_core_set || cli_content_set))
-      global->flags |=  (GLOB_FLG_LAUNCHED_FROM_CLI);
+      rarch_st.flags |=  (RARCH_FLAGS_LAUNCHED_FROM_CLI);
    else
-      global->flags &= ~(GLOB_FLG_LAUNCHED_FROM_CLI);
+      rarch_st.flags &= ~(RARCH_FLAGS_LAUNCHED_FROM_CLI);
 
    /* Copy SRM/state dirs used, so they can be reused on reentrancy. */
    if (retroarch_override_setting_is_set(RARCH_OVERRIDE_SETTING_SAVE_PATH, NULL) &&
@@ -8541,11 +8615,11 @@ static bool retroarch_core_info_savestate_probe(void)
 
 /* What a failed phase leaves behind: no core, no session, and the
  * jmp_buf retroarch_fail() would land in dead. */
-static bool retroarch_main_init_fail(global_t *global)
+static bool retroarch_main_init_fail(void)
 {
    command_event(CMD_EVENT_CORE_DEINIT, NULL);
    runloop_is_inited_clear();
-   global->flags &= ~GLOB_FLG_INIT_IN_PROGRESS;
+   rarch_st.flags &= ~RARCH_FLAGS_INIT_IN_PROGRESS;
    return false;
 }
 
@@ -8643,7 +8717,6 @@ bool retroarch_main_init_core(int argc, char *argv[],
    input_driver_state_t
       *input_st                  = input_state_get_ptr();
    settings_t *settings          = config_get_ptr();
-   global_t            *global   = global_get_ptr();
 #ifdef HAVE_ACCESSIBILITY
    access_state_t *access_st     = access_state_get_ptr();
    bool accessibility_enable     = false;
@@ -8667,27 +8740,27 @@ bool retroarch_main_init_core(int argc, char *argv[],
       AUDIO_FLAGS_SET(audio_state_get_ptr(), AUDIO_FLAG_ACTIVE);
    }
 
-   if (setjmp(global->error_sjlj_context) > 0)
+   if (setjmp(rarch_st.error_sjlj_context) > 0)
    {
       RARCH_ERR("%s: \"%s\"\n",
             msg_hash_to_str(MSG_FATAL_ERROR_RECEIVED_IN),
-            global_get_ptr()->error_string);
-      return retroarch_main_init_fail(global);
+            rarch_st.error_string);
+      return retroarch_main_init_fail();
    }
 
    /* Mark error_sjlj_context as live. retroarch_fail checks this
     * before longjmp'ing; reinit-time driver_init failures that
     * reach retroarch_fail outside this function will log and
     * return rather than landing in a stale jmp_buf. */
-   global->flags |= GLOB_FLG_INIT_IN_PROGRESS;
+   rarch_st.flags |= RARCH_FLAGS_INIT_IN_PROGRESS;
 
-   global->flags |= GLOB_FLG_ERR_ON_INIT;
+   rarch_st.flags |= RARCH_FLAGS_ERR_ON_INIT;
 
    /* Have to initialise non-file logging once at the start... */
    retro_main_log_file_init(NULL, false);
 
    verbosity_enabled = retroarch_parse_input_and_config(p_rarch,
-         global_get_ptr(), argc, argv);
+         argc, argv);
 
 #if defined(HAVE_SSL) && defined(HAVE_NETWORKING)
    /* Apply the persisted TLS certificate-verification policy to the active
@@ -8938,8 +9011,8 @@ bool retroarch_main_init_core(int argc, char *argv[],
    {
 #ifdef HAVE_DYNAMIC
       /* Check if menu was active prior to core initialization */
-      if (   (!(global->flags & GLOB_FLG_LAUNCHED_FROM_CLI))
-          ||   (global->flags & GLOB_FLG_CLI_LOAD_MENU_ON_ERR)
+      if (   (!(rarch_st.flags & RARCH_FLAGS_LAUNCHED_FROM_CLI))
+          ||   (rarch_st.flags & RARCH_FLAGS_CLI_LOAD_MENU_ON_ERR)
 #ifdef HAVE_MENU
           ||  (menu_st->flags & MENU_ST_FLAG_ALIVE)
 #endif
@@ -8978,11 +9051,11 @@ bool retroarch_main_init_core(int argc, char *argv[],
          /* Attempt initializing dummy core */
          runloop_st->current_core_type = CORE_TYPE_DUMMY;
          if (!command_event(CMD_EVENT_CORE_INIT, &runloop_st->current_core_type))
-            return retroarch_main_init_fail(global);
+            return retroarch_main_init_fail();
       }
 #ifdef HAVE_DYNAMIC
       else /* Fall back to regular error handling */
-         return retroarch_main_init_fail(global);
+         return retroarch_main_init_fail();
 #endif
    }
 
@@ -8999,7 +9072,7 @@ bool retroarch_main_init_core(int argc, char *argv[],
          );
 #endif
    /* The jmp_buf dies with this frame; the next phase arms its own. */
-   global->flags &= ~GLOB_FLG_INIT_IN_PROGRESS;
+   rarch_st.flags &= ~RARCH_FLAGS_INIT_IN_PROGRESS;
    *verbosity     = verbosity_enabled;
    return true;
 }
@@ -9012,16 +9085,15 @@ bool retroarch_main_init_drivers(bool staged,
       *input_st                  = input_state_get_ptr();
    settings_t *settings          = config_get_ptr();
    recording_state_t *rec_st     = recording_state_get_ptr();
-   global_t            *global   = global_get_ptr();
 
-   if (setjmp(global->error_sjlj_context) > 0)
+   if (setjmp(rarch_st.error_sjlj_context) > 0)
    {
       RARCH_ERR("%s: \"%s\"\n",
             msg_hash_to_str(MSG_FATAL_ERROR_RECEIVED_IN),
-            global_get_ptr()->error_string);
-      return retroarch_main_init_fail(global);
+            rarch_st.error_string);
+      return retroarch_main_init_fail();
    }
-   global->flags |= GLOB_FLG_INIT_IN_PROGRESS;
+   rarch_st.flags |= RARCH_FLAGS_INIT_IN_PROGRESS;
 
    if (staged)
    {
@@ -9032,7 +9104,9 @@ bool retroarch_main_init_drivers(bool staged,
        * once it is back. */
       struct video_hw_request hw_request;
       video_driver_hw_request_take(&hw_request);
-      driver_uninit(DRIVERS_CMD_ALL, (enum driver_lifetime_flags)0);
+      /* drivers_init() is a few lines down: an input driver that can
+       * outlive the video driver is left running across the two */
+      driver_uninit(DRIVERS_CMD_ALL, DRIVER_LIFETIME_SESSION_SWITCH);
       video_driver_hw_request_restore(&hw_request);
 
       video_state_get_ptr()->main_flags |=  VIDEO_FLAG_ACTIVE;
@@ -9067,7 +9141,7 @@ bool retroarch_main_init_drivers(bool staged,
 
    command_event(CMD_EVENT_SET_PER_GAME_RESOLUTION, NULL);
 
-   global->flags                   &= ~GLOB_FLG_ERR_ON_INIT;
+   rarch_st.flags                   &= ~RARCH_FLAGS_ERR_ON_INIT;
    runloop_is_inited_set();
 
 #ifdef HAVE_DISCORD
@@ -9108,7 +9182,7 @@ bool retroarch_main_init_drivers(bool staged,
    game_ai_init();
 #endif
 
-   global->flags &= ~GLOB_FLG_INIT_IN_PROGRESS;
+   rarch_st.flags &= ~RARCH_FLAGS_INIT_IN_PROGRESS;
    return true;
 }
 
@@ -9333,6 +9407,18 @@ void retroarch_main_deinit_finish(void)
    path_deinit_savefile();
 
    runloop_is_inited_clear();
+
+#ifdef HAVE_CLOUDSYNC
+   /* The save RAM is on disk and no core owns it.  On the way out
+    * the task queue has already been drained, so a sync is not
+    * started there. */
+   if (rarch_st.flags & RARCH_FLAGS_CLOUD_SYNC_ON_DEINIT)
+   {
+      rarch_st.flags &= ~RARCH_FLAGS_CLOUD_SYNC_ON_DEINIT;
+      if (!(runloop_state_get_ptr()->flags & RUNLOOP_FLAG_SHUTDOWN_INITIATED))
+         task_push_cloud_sync();
+   }
+#endif
 }
 
 bool retroarch_ctl(enum rarch_ctl_state state, void *data)
@@ -9362,6 +9448,9 @@ bool retroarch_ctl(enum rarch_ctl_state state, void *data)
          break;
 #endif /* HAVE_XDELTA */
 #endif /* HAVE_PATCH */
+      case RARCH_CTL_UNSET_LAUNCHED_FROM_CLI:
+         p_rarch->flags &= ~RARCH_FLAGS_LAUNCHED_FROM_CLI;
+         break;
       case RARCH_CTL_IS_DUMMY_CORE:
          return runloop_st->current_core_type == CORE_TYPE_DUMMY;
       case RARCH_CTL_IS_CORE_LOADED:
@@ -9411,6 +9500,9 @@ bool retroarch_ctl(enum rarch_ctl_state state, void *data)
       case RARCH_CTL_MAIN_DEINIT:
          if (!retroarch_main_deinit_begin())
             return false;
+         /* In one go: reached on exit and from the load at startup,
+          * before the first frame.  A load from the menu waits these
+          * out a frame at a time (task_content.c). */
          content_wait_for_save_state_task();
          content_wait_for_load_state_task();
          retroarch_main_deinit_finish();
@@ -9723,9 +9815,8 @@ size_t retroarch_get_capabilities(enum rarch_capabilities type,
 
 void retroarch_fail(int err_code, const char *err)
 {
-   global_t *global                = global_get_ptr();
-   strlcpy(global->error_string, err,
-         sizeof(global->error_string));
+   strlcpy(rarch_st.error_string, err,
+         sizeof(rarch_st.error_string));
 
    /* Only longjmp if retroarch_main_init's setjmp is still live.
     * Outside that scope (e.g. when drivers_init runs from
@@ -9742,8 +9833,8 @@ void retroarch_fail(int err_code, const char *err)
     * than crashing. The caller (drivers_init) will see the
     * subsystem fail to init and that subsystem's downstream code
     * is expected to NULL-check its driver pointers. */
-   if (global->flags & GLOB_FLG_INIT_IN_PROGRESS)
-      longjmp(global->error_sjlj_context, err_code);
+   if (rarch_st.flags & RARCH_FLAGS_INIT_IN_PROGRESS)
+      longjmp(rarch_st.error_sjlj_context, err_code);
 
    RARCH_ERR("[Core] retroarch_fail outside retroarch_main_init: %s\n",
          err);
@@ -9754,10 +9845,9 @@ bool should_quit_on_close(void)
 {
 #ifdef HAVE_MENU
    settings_t *settings   = config_get_ptr();
-   global_t   *global     = global_get_ptr();
    if (       ((settings->uints.quit_on_close_content ==
                QUIT_ON_CLOSE_CONTENT_CLI)
-            && (global->flags & GLOB_FLG_LAUNCHED_FROM_CLI))
+            && (rarch_st.flags & RARCH_FLAGS_LAUNCHED_FROM_CLI))
             || (settings->uints.quit_on_close_content ==
                QUIT_ON_CLOSE_CONTENT_ENABLED)
       )
